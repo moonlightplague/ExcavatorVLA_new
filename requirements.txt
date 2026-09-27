@@ -1,0 +1,6 @@
+pyarrow
+pandas
+lerobot
+imageio 
+imageio-ffmpeg
+lerobot[dataset]
