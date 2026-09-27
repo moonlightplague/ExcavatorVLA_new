@@ -1,6 +1,5 @@
 pyarrow
 pandas
-lerobot
 imageio 
 imageio-ffmpeg
-lerobot[dataset]
+lerobot[smolvla]==0.4.4
