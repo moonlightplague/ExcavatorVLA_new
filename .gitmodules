@@ -1,0 +1,12 @@
+[submodule "ExcavatorVLA"]
+	path = ExcavatorVLA
+	url = https://github.com/jxbb824/ExcavatorVLA.git
+	branch = main
+[submodule "ExcavatorVLA-isaac"]
+	path = ExcavatorVLA-isaac
+	url = https://github.com/jxbb824/ExcavatorVLA.git
+	branch = isaac
+[submodule "ExcavatorVLA-smolvla"]
+	path = ExcavatorVLA-smolvla
+	url = https://github.com/jxbb824/ExcavatorVLA.git
+	branch = smolvla
