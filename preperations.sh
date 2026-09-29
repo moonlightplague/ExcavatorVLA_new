@@ -12,12 +12,3 @@ fi
 
 #install pip environments
 pip install -r requirements.txt
-
-#state environment variables
-export BASE=$(pwd)
-export ISAAC_REPO="$BASE/ExcavatorVLA-isaac"
-export POLICY_REPO="$BASE/ExcavatorVLA-smolvla"
-export ISAAC_PYTHON="$BASE/isaacsim/python.sh"
-export POLICY_PYTHON=$(which python)
-export DATA_ROOT=$BASE/data
-export RUN=$DATA_ROOT
