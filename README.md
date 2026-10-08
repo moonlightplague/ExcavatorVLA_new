@@ -10,7 +10,7 @@ cd ExcavatorVLA_new
 ### Conda environment
 Make sure you have conda installed and initialized, then run:
 ```bash
-conda create -n ExcavatorVLA python=3.13
+conda create -n ExcavatorVLA python=3.12
 conda activate ExcavatorVLA
 ```
 All our later expriments would run in this conda environment.
@@ -26,14 +26,43 @@ bash preperations.sh
 export BASE=$(pwd)
 export ISAAC_REPO="$BASE/ExcavatorVLA-isaac"
 export POLICY_REPO="$BASE/ExcavatorVLA-smolvla"
-export ISAAC_PYTHON="$BASE/isaacsim/python.sh"
+export ISAAC_PYTHON="$BASE/run_isaac_python.sh"
 export POLICY_PYTHON=$(which python)
 export DATA_ROOT=$BASE/data
 export RUN=$DATA_ROOT
 ```
 
+The repository launcher gives Isaac Sim's bundled `libpython` priority over
+system and Conda libraries. Calling `isaacsim/python.sh` directly with
+`/usr/lib/x86_64-linux-gnu` at the front of `LD_LIBRARY_PATH` can load the wrong
+Python shared library and segfault before the simulator starts (for example,
+inside `nest_asyncio.apply()` / `_asyncio._get_running_loop()`). Isaac still uses
+its bundled Python; `POLICY_PYTHON` uses the active `ExcavatorVLA` environment.
+
 ## Data collection
 At least 8GB of VRAM is required for an atomic simulation process.
+
+On a minimal Ubuntu container, install the graphics runtime dependencies first:
+
+```bash
+apt-get update
+apt-get install -y libegl1 libgl1 libxt6t64 vulkan-tools
+env -u DISPLAY vulkaninfo --summary
+```
+
+The Vulkan device list must include an NVIDIA GPU. CUDA working in `nvidia-smi`
+does not establish that Vulkan rendering works. Missing `libEGL.so.1` can prevent
+the NVIDIA Vulkan driver from loading, leaving camera warmup waiting for frames.
+Collection prints a heartbeat every 15 seconds; set
+`EXCAVATOR_AUTO_COLLECT_HEARTBEAT_SECONDS=0` to disable it.
+
+The collection launcher allocates RTX pools of 360,000 descriptor sets and
+900,000 resource descriptors before renderer startup. Override these with
+`--rtx-descriptor-sets` and `--rtx-reserved-descriptors` when needed. Headless
+camera windows remain visible inside Kit to avoid repeated show/hide changes;
+the process still uses `--no-window`. Completed camera readbacks release their
+helper references. These changes address `Out of resource descriptors!` during
+capture; a process that has already logged this fatal error must be restarted.
 
 To collect a small dataset (headless mode):
 ```bash
