@@ -80,6 +80,20 @@ cd "$BASE"
 bash collect.sh 50
 ```
 
+To collect 50 successful episodes total with three simulators, one per GPU:
+
+```bash
+bash collect.sh 50 3 0,1,2
+```
+The optional arguments are worker count and comma-separated GPU IDs. Without
+GPU IDs, workers use GPUs `0` through `workers - 1`. Each worker has a unique run
+directory; the parent exports successful episodes sequentially into `data/export`.
+Incomplete targets are retried while collection makes progress. Worker failures
+stop the command after exporting available successful results. Logs and result
+files are saved under `data/raw/.collection_logs/collection_*/round_*/`.
+Ctrl+C stops the worker process groups. `POLICY_PYTHON` selects the export Python
+(default: the active environment), and `DATA_ROOT` overrides the data directory.
+
 ## Export
 Set RUN to the actual `run_*` directory produced above and run the following command to export data: 
 ```bash
