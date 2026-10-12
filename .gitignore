@@ -2,5 +2,8 @@ data/
 data
 isaacsim/
 isaacsim
+outputs
 recent*
 models*
+.venv-smolvla/
+*__pycache__

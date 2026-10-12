@@ -45,8 +45,8 @@ At least 8GB of VRAM is required for an atomic simulation process.
 On a minimal Ubuntu container, install the graphics runtime dependencies first:
 
 ```bash
-apt-get update
-apt-get install -y libegl1 libgl1 libxt6t64 vulkan-tools
+sudo apt-get update
+sudo apt-get install -y libegl1 libgl1 libxt6t64 vulkan-tools
 env -u DISPLAY vulkaninfo --summary
 ```
 
@@ -74,13 +74,19 @@ cd "$ISAAC_REPO"
 ```
 You can change the `--success-count` and `--max-attempts` parameter to acquire for a larger dataset.
 
+To collect and export all trainable episodes in one command:
+```bash
+cd "$BASE"
+bash collect.sh 50
+```
+
 ## Export
 Set RUN to the actual `run_*` directory produced above and run the following command to export data: 
 ```bash
 export RUN=/path/to/excavator-data/raw/run_ACTUAL_TIMESTAMP
 cd "$ISAAC_REPO"
 "$POLICY_PYTHON" excavator_dataset_tools.py "$RUN" \
-  --export-lerobot-v3 --export-limit 1 \
+  --export-lerobot-v3 --export-append \
   --export-dir "$DATA_ROOT/export" \
   --export-require-standard --export-require-vla
 ```
@@ -91,112 +97,67 @@ cd "$POLICY_REPO"
   --dataset-root "$DATA_ROOT/export"
 ```
 
-## Training preperations
-For a current-v4 export, conversion needs the corresponding raw run to reconstruct historical features:
+## Training (current-v4, 28D)
+
+Fine-tune `models/smolvla_base` on `data/export`: 28D state, three cameras,
+4D actions. No 27D conversion needed.
+
+Training and evaluation require unpatched LeRobot 0.4.4. If your existing
+`ExcavatorVLA` environment has the legacy stage-supervision patches, create a
+fresh Conda environment (do not clone the patched environment):
 
 ```bash
-cd "$POLICY_REPO"
-"$POLICY_PYTHON" convert_lerobot_stage_dataset.py \
-  --src "$DATA_ROOT/export" \
-  --dst "$DATA_ROOT/prepared27-stage10" \
-  --raw-run "$RUN" --raw-split trainable \
-  --runtime "$POLICY_REPO/scripts/excavator_app/excavator_runtime.py" \
-  --horizon 30 --video-mode copy
-
-"$POLICY_PYTHON" scripts/dataset/inspect_lerobot_dataset.py \
-  --dataset-root "$DATA_ROOT/prepared27-stage10"
+conda create -n ExcavatorVLA-current python=3.12 -y
+conda activate ExcavatorVLA-current
+python -m pip install -r requirements.txt
+export POLICY_PYTHON="$(command -v python)"
 ```
 
-## Patch checking
-The implemented canonical recipe resumes an existing trained checkpoint. It is not a turnkey fresh-training recipe for arbitrary collected data.
+The launchers use `POLICY_PYTHON` when set, otherwise the active environment's
+`python`. Refresh `POLICY_PYTHON` after switching environments if it was already
+exported. No repository-local virtual environment is required.
 
-In a compatible, unpatched environment, apply the six patchers in this order, using explicit installation paths. Skip this if the original environment already contains the patches; validate its markers instead.
-```bash
-cd "$POLICY_REPO"
-LEROBOT_DIR=$("$POLICY_PYTHON" -c 'import lerobot; print(next(iter(lerobot.__path__)))')
-SMOL_DIR="$LEROBOT_DIR/policies/smolvla"
-
-"$POLICY_PYTHON" scripts/training/patch_smolvla_stage_training.py \
-  --smolvla-dir "$SMOL_DIR"
-
-"$POLICY_PYTHON" scripts/training/patch_smolvla_dynamic_stage_seq50.py \
-  --smolvla-dir "$SMOL_DIR" --factory "$LEROBOT_DIR/datasets/factory.py"
-
-"$POLICY_PYTHON" scripts/training/patch_stage_batch_and_logging.py \
-  --modeling "$SMOL_DIR/modeling_smolvla.py" \
-  --train "$LEROBOT_DIR/scripts/lerobot_train.py"
-
-"$POLICY_PYTHON" scripts/training/patch_smolvla_stage_action_direction_loss.py \
-  --smolvla-dir "$SMOL_DIR"
-
-"$POLICY_PYTHON" scripts/training/patch_smolvla_stage_action_low_motion_loss.py \
-  --smolvla-dir "$SMOL_DIR"
-```
-Stop on a patch mismatch and recover a compatible installation; do not force text replacements into a different LeRobot version.
-
-## Training
-Before running `resume_latest_checkpoint_seed2_fixed5ep_canonical_300epochs.sh`, edit its hardcoded paths for this machine: `PROJECT`, `PYTHON`, `TRAIN`, `DATASET`, `OUTPUT_ROOT`, `LOG_ROOT`, `STAGE_ACTION_PRIOR`, `SMOLVLA_DIR`, and `HF_HOME`. Also inspect absolute paths inside the source checkpoint configs, including VLM and prior paths: the resume script only updates selected config fields. Merely exporting `PROJECT` or `DATASET` does not override unconditional shell assignments.
-
-Then, with the exact prepared dataset and a complete source run:
+The smoke training script runs 20 steps:
 
 ```bash
-cd "$POLICY_REPO"
-SOURCE_OUTPUT=/path/to/complete/source-training-run \
-  bash resume_latest_checkpoint_seed2_fixed5ep_canonical_300epochs.sh
+cd "$BASE"
+bash smoke_train.sh
 ```
 
-The source checkpoint must contain `pretrained_model/{model.safetensors,config.json,train_config.json}` and `training_state/{training_step.json,optimizer_param_groups.json,optimizer_state.safetensors,scheduler_state.json}`. Weights alone cannot perform this true resume.
+Checkpoint: `outputs/train/smolvla_smoke_*/checkpoints/last/pretrained_model`.
 
-The launcher validates inputs, runs a two-step CUDA smoke test, copies the source checkpoint to a new output, and starts training with `nohup`. At 810 frames and batch 144, it uses six steps per epoch; 300 added epochs mean 1,800 added steps (16650 → 18450 for the documented source). The current script uses **16 workers**, although its README says 8. Follow the generated log and verify the final complete checkpoint; launcher exit alone does not mean training finished.
+## Evaluate current 28D model
 
-For a new dataset or training from the base SmolVLA model, a separate training configuration is needed. The repo does not supply a validated general-purpose fresh-training recipe; do not remove the canonical dataset guards and call that reproduction.
-
-## Evaluate offline
-
-With a compatible checkpoint and prepared data, the Python entry point exposes paths directly:
+Evaluate the first N episodes in `data/export` (default: 1):
 
 ```bash
-export DATASET=/path/to/prepared-dataset
-export CHECKPOINT=/path/to/checkpoints/018450/pretrained_model
-cd "$POLICY_REPO"
-"$POLICY_PYTHON" scripts/evaluation/evaluate_smolvla_episodes.py \
-  --dataset "$DATASET" --checkpoint "$CHECKPOINT" \
-  --vlm "$VLM" --prior "$PRIOR" \
-  --num-episodes 5 --seed 2 --device cuda \
-  --output-dir "$DATA_ROOT/offline-eval"
+cd "$BASE"
+bash eval_smolvla.sh outputs/train/<run>/checkpoints/last/pretrained_model 1
 ```
 
-For the canonical experiment, adapt hardcoded paths in `run_latest_three_checkpoints_seed2_fixed5ep_eval.sh`, then run it with `TRAIN_RUN=/path/to/completed/run`. It produces checkpoint comparison CSV/JSON, episode arrays, metrics, and plots. `run_action_stage_chunk_sweep.sh` follows it and compares offline execution chunks. Its chunk length is a separate setting from live replanning or temporal ensembling. Offline action/stage accuracy does not establish successful physical digging/dumping.
+Results: `outputs/eval/smolvla_*/{metrics.json,actions.npz}`.
+Reports action MAE/RMSE in rad/s. Training-data evaluation is a fitting check,
+not a measure of generalization or simulator success.
 
-## Run a live policy smoke test
+## Evaluate current 28D success rate
 
-Use **both simulator and client from `smolvla`**. Its current client uses protocol v2. Do not connect it to `isaac`'s `run_vla_train_scene.py --bridge` or the old Script Editor bridge.
-
-Terminal A (GUI/viewport-capable Isaac session required):
+Requires a working Isaac Sim GUI/display. Each episode starts a fresh simulator.
 
 ```bash
-cd "$POLICY_REPO"
-export EXCAVATOR_PROJECT_ROOT="$POLICY_REPO"
-"$ISAAC_PYTHON" run_simulation.py --scene-seed 2 --sand-amount 1
+cd "$BASE"
+# Checkpoint, episodes, maximum policy steps, minimum deposited particles
+bash eval_smolvla_success.sh outputs/train/<run>/checkpoints/last/pretrained_model 10 350 100
 ```
 
-Terminal B (same path variables as above):
+Uses the existing `ExcavatorVLA-smolvla/run_simulation.py` lockstep simulator,
+28D observations, checkpoint normalization, and dataset FPS. Replans every
+3 steps without a handwritten action supervisor; scene seeds start at 2.
 
-```bash
-cd "$POLICY_REPO"
-mkdir -p "$DATA_ROOT/live-smoke"
-"$POLICY_PYTHON" scripts/bridge_test/smolvla_policy_client.py \
-  --host 127.0.0.1 --port 5555 \
-  --ckpt "$CHECKPOINT" --vlm "$VLM" \
-  --dataset-meta "$DATASET/meta/info.json" --steps 10 \
-  --trace-log "$DATA_ROOT/live-smoke/steps.jsonl" \
-  --chunk-log "$DATA_ROOT/live-smoke/chunks.jsonl"
-```
+Success follows the old rule: deposited particles meet the threshold and do
+not increase for 3 observations. An open bucket ends the successful episode.
+The default threshold is the old value of 1 particle; the example uses 100.
+Runtime errors are reported separately and stop the batch.
 
-This is a short connectivity/inference check, not exact checkpoint reproduction. Use the actual training FPS from metadata. Check that all three camera images are fresh/nonblack, state/effort features match the checkpoint, and commanded joints move in the expected directions. Stop the simulator with Ctrl-C after the client exits.
-
-For the recorded checkpoint-18450 experiment, adapt the paths in **`run_isaacsim_ckpt18450_seed2_one_episode.sh`** and run that launcher. It includes recorded pose/target settings, videos, validation, logs, and result packaging. At the inspected revision it uses 500 policy steps, replanning interval 3, ensemble width 1, and an **enabled hand-written excavation sequence supervisor**. Its results therefore include supervisor intervention. The bare client defaults to model-only execution. Record which mode you used when comparing outcomes.
-
-## What must be supplied before the full run
-
-The immediate next step is to obtain the original Isaac/LeRobot environment identity, local VLM, stage prior, and a complete checkpoint together with its exact prepared dataset. Alternatively, install a compatible Isaac environment and start at the bounded collection test, retaining raw runs. The handover ZIP alone does not establish that the later canonical continuation experiment can be reproduced.
+Results: `outputs/eval/success_*/success_rate_summary.json`, `episode_results.csv`,
+and per-episode logs/action traces. This adapts the legacy evaluation simulator;
+its scene/material settings are not guaranteed identical to the collection scene.
