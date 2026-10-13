@@ -80,10 +80,10 @@ cd "$BASE"
 bash collect.sh 50
 ```
 
-To collect 50 successful episodes total with three simulators, one per GPU:
+To collect 50 successful episodes total with two simulators, one per GPU:
 
 ```bash
-bash collect.sh 50 3 0,1,2
+bash collect.sh 50 2 0,1
 ```
 The optional arguments are worker count and comma-separated GPU IDs. Without
 GPU IDs, workers use GPUs `0` through `workers - 1`. Each worker has a unique run
@@ -93,6 +93,14 @@ stop the command after exporting available successful results. Logs and result
 files are saved under `data/raw/.collection_logs/collection_*/round_*/`.
 Ctrl+C stops the worker process groups. `POLICY_PYTHON` selects the export Python
 (default: the active environment), and `DATA_ROOT` overrides the data directory.
+
+The terminal reports each running worker's latest log line, elapsed time, and
+time since its log last changed every 15 seconds (`COLLECT_STATUS_SECONDS` overrides
+this interval). Initial scene/RTX warmup can take several minutes while CPU shader
+compilation runs and GPU utilization stays low. Keep `isaacsim/kit/cache` between
+runs so compiled shaders can be reused. Each worker also has a separate
+`worker_*.kit.log` for native Isaac diagnostics. To follow all output from a running
+batch, use `tail -F data/raw/.collection_logs/collection_*/round_*/worker_*.log`.
 
 ## Export
 Set RUN to the actual `run_*` directory produced above and run the following command to export data: 
@@ -131,14 +139,38 @@ The launchers use `POLICY_PYTHON` when set, otherwise the active environment's
 `python`. Refresh `POLICY_PYTHON` after switching environments if it was already
 exported. No repository-local virtual environment is required.
 
-The smoke training script runs 20 steps:
+Edit `training_config.yaml` to configure training. It contains dataset and
+checkpoint paths, steps, per-GPU batch size, learning rate and schedule,
+tokenizer length, trainable layers, checkpoint/log frequencies, and GPU/precision
+settings. Paths are resolved relative to the YAML file.
+
+The default is a full 20,000-step run with batch size 8 on GPU 0. Review the
+resolved settings before starting:
 
 ```bash
 cd "$BASE"
-bash smoke_train.sh
+bash train.sh --dry-run
+bash train.sh
 ```
 
-Checkpoint: `outputs/train/smolvla_smoke_*/checkpoints/last/pretrained_model`.
+Use `bash train.sh --config /path/to/config.yaml` for another configuration.
+`smoke_train.sh` is a compatibility alias for the same YAML-driven launcher;
+it no longer hardcodes a 20-step smoke run. For a short check, copy the YAML and
+set `steps: 20`, `batch_size: 1`, `num_workers: 0`, `save_freq: 20`,
+`log_freq: 1`, `policy.scheduler_warmup_steps: 1`, and
+`policy.scheduler_decay_steps: 20`.
+
+Set `launcher.gpu_ids: [0, 1]` to use both GPUs through Accelerate. Batch size
+is per GPU; `launcher.mixed_precision` selects `bf16`, `fp16`, or `"no"`.
+The launcher derives exactly the three dataset cameras and 28D state, applies
+the configured tokenizer length to the saved processor, and handles the
+installed LeRobot action-padding mask spelling inside the training process.
+It leaves the installed package files unchanged. Isaac success evaluation is
+still run separately; `eval_freq` does not configure that simulator.
+
+Each run saves `training_config.yaml`, `resolved_training_config.json`, and
+`train.log`. Checkpoint:
+`outputs/train/excavator_smolvla_*/checkpoints/last/pretrained_model`.
 
 ## Evaluate current 28D model
 
@@ -173,5 +205,11 @@ The default threshold is the old value of 1 particle; the example uses 100.
 Runtime errors are reported separately and stop the batch.
 
 Results: `outputs/eval/success_*/success_rate_summary.json`, `episode_results.csv`,
-and per-episode logs/action traces. This adapts the legacy evaluation simulator;
+and per-episode logs/action traces. Every evaluated episode also saves
+`episodes/episode_XXXX/evaluation.mp4`: a fixed overview plus the three policy
+cameras, with step count, deposited particles, bucket state, and result text.
+Videos play at dataset FPS (simulation time) and hold the final result for two
+seconds. Failed evaluations keep a partial video or an error screen if startup
+failed before images arrived. Video paths are also stored in `episode_status.json`.
+This adapts the legacy evaluation simulator;
 its scene/material settings are not guaranteed identical to the collection scene.

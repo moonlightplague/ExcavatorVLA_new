@@ -3,3 +3,4 @@ pandas
 imageio 
 imageio-ffmpeg
 lerobot[smolvla]==0.4.4
+PyYAML>=6.0

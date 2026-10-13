@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Parse the whole collection routine before starting any long-running work.
+# Otherwise, edits during collection can shift Bash's next read into old code.
+main() {
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISAAC_REPO="$BASE/ExcavatorVLA-isaac"
 ISAAC_PYTHON="${ISAAC_PYTHON:-$BASE/run_isaac_python.sh}"
@@ -8,8 +11,13 @@ POLICY_PYTHON="${POLICY_PYTHON:-$(command -v python)}"
 DATA_ROOT="${DATA_ROOT:-$BASE/data}"
 COUNT="${1:?Usage: bash collect.sh <success_count> [workers] [gpu_ids, e.g. 0,1,2]}"
 WORKERS="${2:-${WORKERS:-1}}"
+STATUS_SECONDS="${COLLECT_STATUS_SECONDS:-15}"
 [[ "$COUNT" =~ ^[1-9][0-9]*$ && "$WORKERS" =~ ^[1-9][0-9]*$ ]] || {
     echo "Success count and workers must be positive integers." >&2
+    exit 2
+}
+[[ "$STATUS_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "COLLECT_STATUS_SECONDS must be a positive integer." >&2
     exit 2
 }
 GPU_IDS="${3:-${GPU_IDS:-}}"
@@ -50,6 +58,7 @@ trap 'exit 143' TERM
 
 echo "Collecting $COUNT successful episodes with $WORKERS worker(s), GPUs=$GPU_IDS"
 echo "Worker logs and results: $LOG_ROOT"
+echo "Progress is reported every ${STATUS_SECONDS}s; scene/RTX initialization can take several minutes."
 cd "$ISAAC_REPO"
 REMAINING="$COUNT"
 ROUND=0
@@ -65,6 +74,7 @@ while (( REMAINING > 0 )); do
         echo "Round $ROUND worker $WORKER: GPU=$GPU target=$TARGET"
         EXCAVATOR_AUTO_RUN_ID_SUFFIX="${BATCH_ID}_r${ROUND}_w${WORKER}" \
         EXCAVATOR_AUTO_COLLECT_RESULT_FILE="$ROUND_DIR/worker_$WORKER.result.json" \
+        EXCAVATOR_KIT_LOG_FILE="$ROUND_DIR/worker_$WORKER.kit.log" \
         PYTHONUNBUFFERED=1 \
         setsid "$ISAAC_PYTHON" run_vla_train_scene.py \
             --headless --auto-collect --no-bridge \
@@ -73,6 +83,31 @@ while (( REMAINING > 0 )); do
             --sand-amount 1.0 --dataset-root "$DATA_ROOT/raw" --disable-export \
             >"$ROUND_DIR/worker_$WORKER.log" 2>&1 &
         PIDS+=("$!")
+    done
+
+    # Keep reporting even when a native Kit update blocks Python's heartbeat.
+    # Poll in the parent so there is no extra monitor process to clean up.
+    ROUND_STARTED=$SECONDS
+    NEXT_STATUS=$SECONDS
+    while :; do
+        RUNNING=0
+        for PID in "${PIDS[@]}"; do
+            if kill -0 "$PID" 2>/dev/null; then RUNNING=1; fi
+        done
+        (( RUNNING != 0 )) || break
+        if (( SECONDS >= NEXT_STATUS )); then
+            NOW=$(date +%s)
+            for (( WORKER=0; WORKER<ACTIVE_WORKERS; WORKER++ )); do
+                PID="${PIDS[$WORKER]}"
+                if ! kill -0 "$PID" 2>/dev/null; then continue; fi
+                WORKER_LOG="$ROUND_DIR/worker_$WORKER.log"
+                LAST_LINE=$(tail -n 1 "$WORKER_LOG" 2>/dev/null || true)
+                LOG_UPDATED=$(stat -c %Y "$WORKER_LOG" 2>/dev/null || echo "$NOW")
+                echo "[worker $WORKER pid=$PID elapsed=$((SECONDS - ROUND_STARTED))s log_age=$((NOW - LOG_UPDATED))s] ${LAST_LINE:-Starting Isaac Sim...}"
+            done
+            NEXT_STATUS=$((SECONDS + STATUS_SECONDS))
+        fi
+        sleep 1
     done
 
     FAILED=0
@@ -125,3 +160,7 @@ PYCODE
         exit 1
     fi
 done
+}
+
+# Parse the exit together with the call so Bash never rereads an edited file.
+main "$@"; exit

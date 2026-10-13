@@ -25,6 +25,7 @@ from excavator_common.deployment_contract import (
     ACTION_NAMES_4D, sha256_files,
 )
 from summarize_isaacsim_success_rate import load_episode_rows, build_summary, write_outputs
+from eval_video import EpisodeVideo
 
 
 def exchange(sock, command):
@@ -60,14 +61,19 @@ def observation(reply):
     images = decode_camera_images(reply, np_module=np)
     for camera in ('0', '1', '2'):
         rgb = images[camera]
-        if rgb.ndim != 3 or rgb.shape[-1] != 3 or not np.any(rgb):
+        # A completed renderer readback may be black when the policy points a
+        # camera into an occluding surface. Validate the delivered image shape;
+        # the simulator validates readback completion and opaque alpha.
+        if rgb.ndim != 3 or rgb.shape[-1] != 3:
             raise ValueError(f'Invalid camera {camera}')
         tensor = torch.from_numpy(rgb.copy()).permute(2, 0, 1).unsqueeze(0).float() / 255
         batch[f'observation.images.{camera}'] = F.interpolate(tensor, (256, 256), mode='bilinear', align_corners=False)
     return batch
 
 
-def connect_simulator(process, port, timeout=300):
+def connect_simulator(process, port, timeout=600):
+    started = time.monotonic()
+    next_report = started + 15
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -77,6 +83,11 @@ def connect_simulator(process, port, timeout=300):
             sock.settimeout(120)
             return sock
         except OSError:
+            now = time.monotonic()
+            if now >= next_report:
+                print(f'Waiting for simulator startup: {now - started:.0f}s elapsed '
+                      f'(limit {timeout}s); see simulator.log for initialization details.', flush=True)
+                next_report = now + 15
             time.sleep(1)
     raise TimeoutError('Simulator startup timed out; see simulator.log')
 
@@ -135,19 +146,24 @@ def main():
                   'success': False, 'task_completed_success_and_bucket_open': False,
                   'policy_steps_inferred': 0, 'policy_steps_executed': 0,
                   'early_terminated': False, 'error': None, 'scene_seed': args.seed + index - 1}
+        video = EpisodeVideo(folder / 'evaluation.mp4', index, status['scene_seed'],
+                             info['fps'], args.steps, args.min_particles)
+        status['video_path'] = str(video.path)
         # A fresh simulator resets sand, the robot, truck counts and observation history.
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             port = probe.getsockname()[1]
-        env = dict(os.environ, EXCAVATOR_PROJECT_ROOT=str(REPO), EXCAVATOR_BRIDGE_PORT=str(port))
+        env = dict(os.environ, EXCAVATOR_PROJECT_ROOT=str(REPO), EXCAVATOR_BRIDGE_PORT=str(port),
+                   EXCAVATOR_EVAL_VIDEO='1')
         torch.manual_seed(status['scene_seed'])
         started = time.monotonic()
         with (folder / 'simulator.log').open('w') as log:
-            process = subprocess.Popen([str(BASE / 'run_isaac_python.sh'), str(REPO / 'run_simulation.py'),
-                                        '--scene-seed', str(status['scene_seed']), '--sand-amount', '1'],
-                                       cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                       start_new_session=True)
+            process = None
             try:
+                process = subprocess.Popen([str(BASE / 'run_isaac_python.sh'), str(REPO / 'run_simulation.py'),
+                                            '--scene-seed', str(status['scene_seed']), '--sand-amount', '1'],
+                                           cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                           start_new_session=True)
                 with connect_simulator(process, port) as sock, (folder / 'steps.jsonl').open('w') as trace:
                     scene = exchange(sock, {'type': 'scene_context'})
                     contract = build_client_contract(info['fps'], normalization_hash,
@@ -161,6 +177,8 @@ def main():
                     reply = exchange(sock, {'joint_velocities': [0.0] * 4})
                     baseline = deposited_count(reply)
                     previous = stable_steps = 0
+                    video.write(reply, {**status, 'status': 'running',
+                                        'final_bucket_open': float(reply['joint_positions'][3]) >= -0.80})
                     policy.reset()
                     actions = []
                     policy_start = time.monotonic()
@@ -194,6 +212,7 @@ def main():
                                                 'deposited_particles': count, 'stable_steps': stable_steps,
                                                 'bucket_position': bucket_q, 'bridge_timing': reply['bridge_timing']}) + '\n')
                         trace.flush()
+                        video.write(reply, {**status, 'status': 'running'}, stable_steps)
                         if success and bucket_open:
                             status.update(early_terminated=True, termination_reason='success_and_bucket_open',
                                           task_completion_time_from_policy_start_seconds=elapsed,
@@ -210,9 +229,18 @@ def main():
                 status['error'] = f'{type(exc).__name__}: {exc}'
                 failed = True
             finally:
-                stop_simulator(process)
+                if process is not None:
+                    stop_simulator(process)
+                try:
+                    video.finish(status)
+                    status['video_frames'] = video.frame_count
+                except Exception as exc:
+                    status['video_error'] = f'{type(exc).__name__}: {exc}'
+                    print(f"Episode {index} video error: {status['video_error']}", flush=True)
+                    failed = True
                 (folder / 'episode_status.json').write_text(json.dumps(status, indent=2) + '\n')
         print(f"Episode {index}: {status['status']}, success={status['success']}, error={status['error']}", flush=True)
+        print(f'Video: {video.path}', flush=True)
         summary = build_summary(load_episode_rows(args.output / 'episodes'), args.episodes)
         write_outputs(args.output, load_episode_rows(args.output / 'episodes'), summary)
         if failed:

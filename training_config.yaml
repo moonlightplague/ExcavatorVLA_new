@@ -1,0 +1,49 @@
+# Paths are relative to this YAML file. This is a full training run, not a smoke test.
+dataset:
+  repo_id: local/excavator
+  root: data/export
+  episodes: null                 # Set a list of episode IDs to select training data.
+  video_backend: pyav
+  image_transforms:
+    enable: false
+
+policy:
+  path: models/smolvla_base      # Local pretrained checkpoint directory.
+  device: cuda
+  load_vlm_weights: false        # The full SmolVLA checkpoint restores backbone weights.
+  push_to_hub: false
+  freeze_vision_encoder: true
+  train_expert_only: true
+  train_state_proj: true
+  n_obs_steps: 1
+  chunk_size: 50
+  n_action_steps: 50
+  num_steps: 10                  # Flow-matching inference iterations.
+  tokenizer_max_length: 64
+  optimizer_lr: 0.0001
+  optimizer_weight_decay: 0.0000000001
+  optimizer_grad_clip_norm: 10.0
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 20000
+  scheduler_decay_lr: 0.0000025
+
+steps: 20000
+batch_size: 8                   # Per GPU; two GPUs with batch_size=8 means batch 16.
+num_workers: 4                  # Data-loading workers per training process.
+seed: 1000
+save_freq: 2000
+log_freq: 50
+eval_freq: 0                    # Isaac success evaluation is run separately.
+save_checkpoint: true
+job_name: excavator_smolvla
+output_dir: null                # null creates a unique directory under output_root.
+
+wandb:
+  enable: false
+  project: excavator-smolvla
+
+launcher:
+  output_root: outputs/train
+  hf_home: models/hf-cache
+  gpu_ids: [0, 1]                  # Use [0, 1] for distributed training on both GPUs.
+  mixed_precision: bf16         # no, fp16, or bf16; controlled through Accelerate.
