@@ -16,8 +16,8 @@ policy:
   train_expert_only: true
   train_state_proj: true
   n_obs_steps: 1
-  chunk_size: 50
-  n_action_steps: 50
+  chunk_size: 10                 # Predict 1 s at 10 Hz; contact dynamics need frequent feedback.
+  n_action_steps: 3              # Execute 0.3 s, then replan from new observations.
   num_steps: 10                  # Flow-matching inference iterations.
   tokenizer_max_length: 64
   optimizer_lr: 0.0001

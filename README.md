@@ -1,5 +1,8 @@
 # ExcavatorVLA_new
 
+See [the training/deployment diagnosis](docs/training_diagnosis.md) for the
+verified causes of the failed SmolVLA evaluations, fixes, checkpoints and videos.
+
 ## Preperations
 
 ### Clone the repo
@@ -144,7 +147,7 @@ checkpoint paths, steps, per-GPU batch size, learning rate and schedule,
 tokenizer length, trainable layers, checkpoint/log frequencies, and GPU/precision
 settings. Paths are resolved relative to the YAML file.
 
-The default is a full 20,000-step run with batch size 8 on GPU 0. Review the
+The default is a full 20,000-step run with batch size 8 per GPU on GPUs 0 and 1. Review the
 resolved settings before starting:
 
 ```bash
@@ -162,9 +165,13 @@ set `steps: 20`, `batch_size: 1`, `num_workers: 0`, `save_freq: 20`,
 
 Set `launcher.gpu_ids: [0, 1]` to use both GPUs through Accelerate. Batch size
 is per GPU; `launcher.mixed_precision` selects `bf16`, `fp16`, or `"no"`.
-The launcher derives exactly the three dataset cameras and 28D state, applies
-the configured tokenizer length to the saved processor, and handles the
-installed LeRobot action-padding mask spelling inside the training process.
+The launcher derives exactly the three dataset cameras and 28D state and applies
+the configured tokenizer length to the saved processor. Its flow-matching loss
+uses the four real action dimensions and divides by valid supervised timesteps;
+28 artificial action channels and episode padding contribute no loss. Recovery
+weights are queried at each future action timestamp. The pretrained 32D heads
+remain compatible. The default predicts 10 actions (1 second at 10 Hz) and
+executes 3 before replanning.
 It leaves the installed package files unchanged. Isaac success evaluation is
 still run separately; `eval_freq` does not configure that simulator.
 
@@ -198,6 +205,13 @@ bash eval_smolvla_success.sh outputs/train/<run>/checkpoints/last/pretrained_mod
 Uses the existing `ExcavatorVLA-smolvla/run_simulation.py` lockstep simulator,
 28D observations, checkpoint normalization, and dataset FPS. Replans every
 3 steps without a handwritten action supervisor; scene seeds start at 2.
+The simulator opens the collection USD in `ExcavatorVLA-isaac`, preserving its
+authored robot base pose, lighting and rectangular retaining walls. Evaluation
+uses dataset episode 0's initial joint pose by default (`--initial-episode`
+selects another), and integrates command velocities into a persistent position
+target across requests, matching the training action semantics. Random scenes
+reject truck footprints overlapping the excavator body; center distance alone
+can admit a long truck that physically locks the swing joint.
 
 Success follows the old rule: deposited particles meet the threshold and do
 not increase for 3 observations. An open bucket ends the successful episode.
@@ -211,5 +225,22 @@ cameras, with step count, deposited particles, bucket state, and result text.
 Videos play at dataset FPS (simulation time) and hold the final result for two
 seconds. Failed evaluations keep a partial video or an error screen if startup
 failed before images arrived. Video paths are also stored in `episode_status.json`.
-This adapts the legacy evaluation simulator;
-its scene/material settings are not guaranteed identical to the collection scene.
+For diagnosis, reproduce a raw successful episode's exact truck, sand, joint
+pose, task and planning targets. Additional evaluator options follow the first
+four launcher arguments:
+
+```bash
+export CHECKPOINT=outputs/train/<run>/checkpoints/last/pretrained_model
+export REFERENCE=data/raw/<run>/episode_<id>
+bash eval_smolvla_success.sh "$CHECKPOINT" 1 350 100 --reference-episode "$REFERENCE"
+# Test exported expert actions independently of the policy:
+bash eval_smolvla_success.sh "$CHECKPOINT" 1 350 100 --reference-episode "$REFERENCE" --replay-reference
+# Audit causal alignment, cadence, limits and normalization:
+"$POLICY_PYTHON" scripts/audit_smolvla_data.py --dataset data/export --chunk-size 10 --output outputs/analysis/data_audit.json
+```
+
+Reference evaluation fails when the initial target-relative geometry differs
+from collection by more than 5 cm. `initial_observation.json` and `steps.jsonl`
+record state and commanded positions for debugging. Expert replay is explicitly
+marked `execution_source: expert_replay`; its success is not model success.
+Particle regeneration and contact physics can still differ between launches.

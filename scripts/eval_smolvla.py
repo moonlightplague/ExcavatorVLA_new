@@ -33,11 +33,12 @@ def main():
         policy.config, pretrained_path=str(args.checkpoint),
         preprocessor_overrides={'device_processor': {'device': 'cuda'}},
     )
-    predictions, targets, episode_ids = [], [], []
+    predictions, targets, episode_ids, phases = [], [], [], []
     with torch.inference_mode():
         for batch in tqdm(DataLoader(dataset, batch_size=8, num_workers=0), desc='Evaluation'):
             targets.append(batch['action'].numpy().copy())
             episode_ids.append(batch['episode_index'].numpy())
+            phases.append(batch['observation.stage_current_id'].numpy())
             observation = {key: batch[key] for key in policy.config.input_features if key in batch}
             observation['task'] = batch['task']
             policy.reset()
@@ -47,6 +48,7 @@ def main():
     if not np.isfinite(predicted).all() or not np.isfinite(target).all():
         raise ValueError('Non-finite actions found')
     error = predicted - target
+    stage_ids = np.concatenate(phases).reshape(-1)
     names = meta.features['action']['names']
     metrics = {
         'checkpoint': str(args.checkpoint.resolve()), 'dataset': str(args.dataset.resolve()),
@@ -54,6 +56,12 @@ def main():
         'note': 'First N episodes; may overlap training data. Not a closed-loop success metric.',
         'seed': 0, 'episodes': args.num_episodes, 'frames': len(target), 'units': 'rad/s',
         'mae': float(np.abs(error).mean()), 'rmse': float(np.sqrt(np.mean(error ** 2))),
+        'zero_action_baseline': {'mae': float(np.abs(target).mean()),
+                                 'rmse': float(np.sqrt(np.mean(target ** 2)))},
+        'per_phase': {name: {'frames': int((stage_ids == i).sum()),
+                             'mae': float(np.abs(error[stage_ids == i]).mean()),
+                             'rmse': float(np.sqrt(np.mean(error[stage_ids == i] ** 2)))}
+                      for i, name in enumerate(meta.info['canonical_phase_names']) if np.any(stage_ids == i)},
         'per_joint': {name: {'mae': float(np.abs(error[:, i]).mean()),
                              'rmse': float(np.sqrt(np.mean(error[:, i] ** 2)))}
                       for i, name in enumerate(names)},
@@ -61,7 +69,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / 'metrics.json').write_text(json.dumps(metrics, indent=2) + '\n')
     np.savez_compressed(args.output / 'actions.npz', predicted=predicted, target=target,
-                        episode_index=np.concatenate(episode_ids))
+                        episode_index=np.concatenate(episode_ids), stage_id=stage_ids)
     print(json.dumps(metrics, indent=2))
     print(f'Results: {args.output}')
 

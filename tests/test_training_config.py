@@ -78,7 +78,7 @@ class TrainingConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'must not exceed steps'):
             train.build_train_config(settings)
 
-    def test_processor_overrides_and_padding_alias_are_applied(self):
+    def test_processor_overrides_are_applied(self):
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         calls = {}
@@ -88,25 +88,15 @@ class TrainingConfigTests(unittest.TestCase):
             return 'preprocessor', 'postprocessor'
 
         trainer = SimpleNamespace(make_policy=lambda **kwargs: kwargs,
+                                  make_dataset=lambda *args, **kwargs: None,
                                   make_pre_post_processors=make_processors)
         cfg = train.build_train_config(self.load()[0])
         original = SmolVLAPolicy.forward
-        seen = {}
-
-        def forward(self, batch, *args, **kwargs):
-            seen.update(batch)
-            return 'loss'
-
         self.addCleanup(setattr, SmolVLAPolicy, 'forward', original)
-        SmolVLAPolicy.forward = forward
         train.install_trainer_adapters(trainer, cfg)
         trainer.make_pre_post_processors(preprocessor_overrides={'device_processor': {'device': 'cpu'}})
         self.assertEqual(calls['preprocessor_overrides']['tokenizer_processor']['max_length'], 64)
         self.assertEqual(calls['preprocessor_overrides']['device_processor']['device'], 'cpu')
-        batch = {'action_is_pad': [False, True]}
-        self.assertEqual(SmolVLAPolicy.forward(None, batch), 'loss')
-        self.assertEqual(seen['actions_id_pad'], batch['action_is_pad'])
-        self.assertNotIn('actions_id_pad', batch)
 
     def test_auxiliary_dataset_labels_do_not_become_policy_outputs(self):
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
@@ -118,11 +108,69 @@ class TrainingConfigTests(unittest.TestCase):
         original = SmolVLAPolicy.forward
         self.addCleanup(setattr, SmolVLAPolicy, 'forward', original)
         trainer = SimpleNamespace(make_policy=lambda **kwargs: kwargs['ds_meta'],
+                                  make_dataset=lambda *args, **kwargs: None,
                                   make_pre_post_processors=lambda **kwargs: None)
         train.install_trainer_adapters(trainer, cfg)
         filtered = trainer.make_policy(cfg=cfg.policy, ds_meta=meta)
         self.assertEqual(set(filtered.features), {*cfg.policy.input_features, 'action'})
         self.assertEqual(meta.info, before)
+
+    def test_recovery_weights_follow_future_actions_and_episode_padding(self):
+        from lerobot.datasets.factory import make_dataset
+        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+        cfg = train.build_train_config(self.load()[0])
+        cfg.dataset.episodes = [0]
+        original = SmolVLAPolicy.forward
+        self.addCleanup(setattr, SmolVLAPolicy, 'forward', original)
+        trainer = SimpleNamespace(make_dataset=make_dataset, make_policy=lambda **kw: None,
+                                  make_pre_post_processors=lambda **kw: None)
+        train.install_trainer_adapters(trainer, cfg)
+        dataset = trainer.make_dataset(cfg)
+        last = dataset[len(dataset) - 1]
+        self.assertEqual(tuple(last['action_loss_weight'].shape), (cfg.policy.chunk_size,))
+        self.assertEqual(last['action_is_pad'].tolist(), [False] + [True] * (cfg.policy.chunk_size - 1))
+        self.assertEqual(dataset.delta_indices['action'], dataset.delta_indices['action_loss_weight'])
+
+
+class ExcavatorLossTests(unittest.TestCase):
+    def forward(self, losses, **batch):
+        import torch
+        policy = SimpleNamespace(
+            config=SimpleNamespace(adapt_to_pi_aloha=False, action_feature=SimpleNamespace(shape=[4])),
+            prepare_images=lambda b: (None, None), prepare_state=lambda b: None,
+            prepare_action=lambda b: None, model=SimpleNamespace(forward=lambda *args: losses),
+        )
+        return train.excavator_forward(policy, {
+            'observation.language.tokens': None, 'observation.language.attention_mask': None, **batch,
+        })[0]
+
+    def test_artificial_channels_and_episode_padding_have_no_loss_or_gradient(self):
+        import torch
+        losses = torch.ones(2, 3, 32, requires_grad=True)
+        pad = torch.tensor([[False, False, True], [False, True, True]])
+        value = self.forward(losses, action_is_pad=pad)
+        self.assertEqual(value.item(), 1)
+        value.backward()
+        self.assertEqual(losses.grad[..., 4:].abs().sum().item(), 0)
+        self.assertEqual(losses.grad[pad].abs().sum().item(), 0)
+        self.assertAlmostEqual(losses.grad.sum().item(), 1, places=6)
+
+    def test_perturbations_mask_only_their_own_future_timesteps(self):
+        import torch
+        losses = torch.ones(1, 3, 32, requires_grad=True)
+        value = self.forward(losses, action_loss_weight=torch.tensor([[1., 0., 1.]]))
+        value.backward()
+        self.assertEqual(value.item(), 1)
+        self.assertEqual(losses.grad[:, 1].abs().sum().item(), 0)
+        self.assertGreater(losses.grad[:, 2].sum().item(), 0)
+
+    def test_fully_masked_batch_is_finite_and_differentiable(self):
+        import torch
+        losses = torch.ones(1, 3, 32, requires_grad=True)
+        value = self.forward(losses, action_loss_weight=torch.zeros(1, 3))
+        self.assertEqual(value.item(), 0)
+        value.backward()
+        self.assertEqual(losses.grad.abs().sum().item(), 0)
 
 
 if __name__ == '__main__':

@@ -81,6 +81,12 @@ def build_train_config(settings):
     features = info['features']
     if features['observation.state']['shape'] != [28] or features['action']['shape'] != [4]:
         raise ValueError('Expected current-v4 28D state and 4D actions.')
+    sys.path.insert(0, str(BASE / 'ExcavatorVLA-smolvla'))
+    from excavator_common.deployment_contract import STATE_NAMES_28D, ACTION_NAMES_4D
+    if features['observation.state']['names'] != list(STATE_NAMES_28D):
+        raise ValueError('Dataset state names/order do not match the deployment contract.')
+    if features['action']['names'] != list(ACTION_NAMES_4D):
+        raise ValueError('Dataset action names/order do not match canonical command velocities.')
     inputs = {'observation.state': {'type': 'STATE', 'shape': [28]}}
     for name in ('0', '1', '2'):
         key = f'observation.images.{name}'
@@ -108,6 +114,20 @@ def install_trainer_adapters(trainer, cfg):
     """Keep compatibility changes local to this process, not site-packages."""
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
+    make_dataset = trainer.make_dataset
+
+    @functools.wraps(make_dataset)
+    def make_excavator_dataset(*args, **kwargs):
+        dataset = make_dataset(*args, **kwargs)
+        # Recovery labels must refer to each FUTURE action, not just the
+        # observation at the start of a chunk. LeRobot only chunks "action".
+        if 'action_loss_weight' in dataset.features:
+            dataset.delta_timestamps['action_loss_weight'] = list(dataset.delta_timestamps['action'])
+            dataset.delta_indices['action_loss_weight'] = list(dataset.delta_indices['action'])
+        return dataset
+
+    trainer.make_dataset = make_excavator_dataset
+
     make_policy = trainer.make_policy
 
     @functools.wraps(make_policy)
@@ -134,15 +154,49 @@ def install_trainer_adapters(trainer, cfg):
         return make_processors(*args, **kwargs)
 
     trainer.make_pre_post_processors = make_excavator_processors
-    forward = SmolVLAPolicy.forward
+    SmolVLAPolicy.forward = excavator_forward
 
-    @functools.wraps(forward)
-    def forward_with_padding(self, batch, *args, **kwargs):
-        if 'action_is_pad' in batch:
-            batch = {**batch, 'actions_id_pad': batch['action_is_pad']}
-        return forward(self, batch, *args, **kwargs)
 
-    SmolVLAPolicy.forward = forward_with_padding
+def excavator_forward(self, batch, noise=None, time=None, reduction='mean'):
+    """Flow loss over valid, supervised timesteps and the four real joints.
+
+    LeRobot 0.4.4 averages over max_action_dim (32), including 28 artificial
+    channels, and counts masked episode padding in the mean's denominator.
+    Keep the pretrained 32D heads; only change the training loss reduction.
+    """
+    import torch
+
+    if self.config.adapt_to_pi_aloha:
+        batch = {**batch, 'observation.state': self._pi_aloha_decode_state(batch['observation.state']),
+                 'action': self._pi_aloha_encode_actions_inv(batch['action'])}
+    images, image_masks = self.prepare_images(batch)
+    losses = self.model.forward(
+        images, image_masks, batch['observation.language.tokens'],
+        batch['observation.language.attention_mask'], self.prepare_state(batch),
+        self.prepare_action(batch), noise, time,
+    )
+    losses = losses[..., :self.config.action_feature.shape[0]]
+    weights = torch.ones_like(losses[..., 0])
+    padding = batch.get('action_is_pad', batch.get('actions_id_pad'))
+    if padding is not None:
+        weights = weights * (~padding).to(weights.dtype)
+    supervision = batch.get('action_loss_weight')
+    if supervision is not None:
+        if supervision.ndim == 3 and supervision.shape[-1] == 1:
+            supervision = supervision.squeeze(-1)
+        if supervision.shape != weights.shape:
+            raise ValueError('action_loss_weight must be chunked with the same timestamps as action')
+        weights = weights * supervision
+    numerator = (losses * weights.unsqueeze(-1)).sum(dim=(1, 2))
+    denominator = weights.sum(dim=1) * losses.shape[-1]
+    per_sample = numerator / denominator.clamp_min(1)
+    loss = numerator.sum() / denominator.sum().clamp_min(1)
+    metrics = {'loss': loss.detach().item(), 'supervised_action_fraction': weights.mean().detach().item()}
+    if reduction == 'none':
+        return per_sample, metrics
+    if reduction != 'mean':
+        raise ValueError(f'Unsupported loss reduction: {reduction}')
+    return loss, metrics
 
 
 def run_training(cfg, launcher, config_path):

@@ -26,6 +26,7 @@ from excavator_common.deployment_contract import (
 )
 from summarize_isaacsim_success_rate import load_episode_rows, build_summary, write_outputs
 from eval_video import EpisodeVideo
+from excavator_diagnostics import dataset_initial_pose, reference_episode
 
 
 def exchange(sock, command):
@@ -112,10 +113,20 @@ def main():
     parser.add_argument('--min-particles', type=int, default=1)
     parser.add_argument('--seed', type=int, default=2)
     parser.add_argument('--replan-interval', type=int, default=3)
+    parser.add_argument('--initial-episode', type=int, default=0,
+                        help='Use this dataset episode initial joint pose for randomized scenes.')
+    parser.add_argument('--reference-episode', type=Path,
+                        help='Raw successful episode directory; reproduce its scene, pose, targets and task.')
+    parser.add_argument('--replay-reference', action='store_true',
+                        help='Execute reference expert actions instead of model actions to test the simulator.')
     args = parser.parse_args()
     if min(args.episodes, args.steps, args.min_particles, args.replan_interval) < 1:
         parser.error('Episode, step, particle and replanning counts must be positive')
     info = json.loads((args.dataset / 'meta/info.json').read_text())
+    if args.replay_reference and args.reference_episode is None:
+        parser.error('--replay-reference requires --reference-episode')
+    reference = reference_episode(args.reference_episode, info['fps']) if args.reference_episode else None
+    initial_pose = reference['initial_joints_deg'] if reference else dataset_initial_pose(args.dataset, args.initial_episode)
     action_limits = np.asarray(info['action_limits_rad_s'], dtype=np.float32)
     if action_limits.shape != (4,) or not np.isfinite(action_limits).all() or np.any(action_limits <= 0):
         raise ValueError('Invalid dataset action limits')
@@ -123,21 +134,26 @@ def main():
         raise ValueError('Expected current-v4 dataset feature order')
     if info['features']['action']['names'] != list(ACTION_NAMES_4D):
         raise ValueError('Expected canonical four-joint velocity actions')
-    policy = SmolVLAPolicy.from_pretrained(str(args.checkpoint)).to('cuda').eval()
-    if list(policy.config.input_features['observation.state'].shape) != [28]:
-        raise ValueError('Expected a 28D checkpoint')
-    if list(policy.config.output_features['action'].shape) != [4]:
-        raise ValueError('Expected a 4D action checkpoint')
-    preprocess, postprocess = make_pre_post_processors(
-        policy.config, pretrained_path=str(args.checkpoint),
-        preprocessor_overrides={'device_processor': {'device': 'cuda'}},
-    )
+    policy = None
+    if not args.replay_reference:
+        policy = SmolVLAPolicy.from_pretrained(str(args.checkpoint)).to('cuda').eval()
+        if list(policy.config.input_features['observation.state'].shape) != [28]:
+            raise ValueError('Expected a 28D checkpoint')
+        if list(policy.config.output_features['action'].shape) != [4]:
+            raise ValueError('Expected a 4D action checkpoint')
+        preprocess, postprocess = make_pre_post_processors(
+            policy.config, pretrained_path=str(args.checkpoint),
+            preprocessor_overrides={'device_processor': {'device': 'cuda'}},
+        )
     normalization_hash = sha256_files(sorted(args.checkpoint.glob('*processor*')))
     args.output.mkdir(parents=True, exist_ok=False)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     config.update(training_fps=info['fps'], supervisor=False, bucket_open_threshold=-0.80,
-                  success_no_growth_steps=3, simulator=str(REPO / 'run_simulation.py'))
+                  success_no_growth_steps=3, simulator=str(REPO / 'run_simulation.py'),
+                  initial_joints_deg=initial_pose, execution_source='expert_replay' if args.replay_reference else 'model')
     (args.output / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
+    if reference:
+        (args.output / 'scene_profile.json').write_text(json.dumps(reference['profile'], indent=2) + '\n')
     failed = False
     for index in range(1, args.episodes + 1):
         folder = args.output / 'episodes' / f'episode_{index:04d}'
@@ -160,8 +176,16 @@ def main():
         with (folder / 'simulator.log').open('w') as log:
             process = None
             try:
-                process = subprocess.Popen([str(BASE / 'run_isaac_python.sh'), str(REPO / 'run_simulation.py'),
-                                            '--scene-seed', str(status['scene_seed']), '--sand-amount', '1'],
+                command = [str(BASE / 'run_isaac_python.sh'), str(REPO / 'run_simulation.py'),
+                           '--scene-seed', str(status['scene_seed']), '--sand-amount',
+                           str(reference['sand_amount'] if reference else 1),
+                           '--robot-initial-joints-deg', *map(str, initial_pose)]
+                if reference:
+                    command += ['--scene-profile', str((args.output / 'scene_profile.json').resolve()),
+                                '--state27-dig-target-world', *map(str, reference['dig_target_xyz']),
+                                '--state27-unload-target-world', *map(str, reference['profile']['unload_landing_xyz']),
+                                '--task-text', reference['task']]
+                process = subprocess.Popen(command,
                                            cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT,
                                            start_new_session=True)
                 with connect_simulator(process, port) as sock, (folder / 'steps.jsonl').open('w') as trace:
@@ -175,17 +199,31 @@ def main():
                         raise ValueError(f'Invalid deployment handshake: {ack}')
                     (folder / 'contract.json').write_text(json.dumps({'request': contract, 'reply': ack}, indent=2))
                     reply = exchange(sock, {'joint_velocities': [0.0] * 4})
+                    initial_state = np.asarray(reply['observation_state_28d'])
+                    initial_report = {'state': initial_state.tolist(), 'task': reply['task_text']}
+                    if reference:
+                        initial_report['reference_state_error'] = (initial_state - reference['expected_initial_state']).tolist()
+                    (folder / 'initial_observation.json').write_text(json.dumps(initial_report, indent=2) + '\n')
+                    if reference and np.max(np.abs(initial_report['reference_state_error'][16:26])) > 0.05:
+                        raise ValueError('Reference scene geometry differs by more than 0.05 from collection; see initial_observation.json')
                     baseline = deposited_count(reply)
                     previous = stable_steps = 0
                     video.write(reply, {**status, 'status': 'running',
                                         'final_bucket_open': float(reply['joint_positions'][3]) >= -0.80})
-                    policy.reset()
+                    if policy is not None:
+                        policy.reset()
                     actions = []
                     policy_start = time.monotonic()
                     for step in range(args.steps):
                         # Validate every returned observation, including between replans.
                         batch = observation(reply)
-                        if not actions:
+                        input_state = batch['observation.state'][0].tolist()
+                        if args.replay_reference:
+                            if step >= len(reference['actions']):
+                                status['termination_reason'] = 'reference_finished'
+                                break
+                            actions = [reference['actions'][step]]
+                        elif not actions:
                             with torch.inference_mode():
                                 chunk = policy.predict_action_chunk(preprocess(batch))
                                 actions = [postprocess(chunk[:, i]).cpu().numpy()[0]
@@ -204,11 +242,15 @@ def main():
                         elapsed = time.monotonic() - policy_start
                         status.update(success=success, task_completed_success_and_bucket_open=success and bucket_open,
                                       policy_steps_executed=step + 1, final_newly_deposited_particle_count=count,
-                                      final_bucket_position_rad=bucket_q, final_bucket_open=bucket_open)
+                                      final_bucket_position_rad=bucket_q, final_bucket_open=bucket_open,
+                                      max_bucket_particles=max(status.get('max_bucket_particles', 0),
+                                                               int(reply['bucket_load_metrics']['count'])))
                         if success and 'success_time_from_policy_start_seconds' not in status:
                             status['success_time_from_policy_start_seconds'] = elapsed
                             status['success_time_from_simulation_launch_seconds'] = time.monotonic() - started
                         trace.write(json.dumps({'step': step, 'predicted': predicted.tolist(), 'applied': applied.tolist(),
+                                                'input_state': input_state, 'state': reply['observation_state_28d'],
+                                                'joint_command_positions': reply['joint_command_positions'],
                                                 'deposited_particles': count, 'stable_steps': stable_steps,
                                                 'bucket_position': bucket_q, 'bridge_timing': reply['bridge_timing']}) + '\n')
                         trace.flush()
@@ -222,7 +264,8 @@ def main():
                                   rollout_time_from_simulation_launch_seconds=time.monotonic() - started)
                     status.setdefault('termination_reason', 'step_limit')
                     (folder / 'rollout_validation.json').write_text(json.dumps({
-                        'status': 'passed', 'pure_model_execution_validated': True,
+                        'status': 'passed', 'pure_model_execution_validated': not args.replay_reference,
+                        'execution_source': config['execution_source'],
                         'supervisor_enabled': False, 'action_velocity_limits': action_limits.tolist(),
                     }, indent=2))
             except Exception as exc:

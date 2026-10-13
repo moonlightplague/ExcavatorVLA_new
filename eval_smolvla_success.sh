@@ -8,4 +8,4 @@ CHECKPOINT="${1:?Usage: bash eval_smolvla_success.sh <pretrained_model_dir> [epi
 "$POLICY_PYTHON" scripts/eval_smolvla_success.py \
     --checkpoint "$CHECKPOINT" --dataset "$PWD/data/export" \
     --episodes "${2:-1}" --steps "${3:-350}" --min-particles "${4:-1}" \
-    --output "$PWD/outputs/eval/success_$(date +%Y%m%d_%H%M%S)_$$"
+    --output "$PWD/outputs/eval/success_$(date +%Y%m%d_%H%M%S)_$$" "${@:5}"
