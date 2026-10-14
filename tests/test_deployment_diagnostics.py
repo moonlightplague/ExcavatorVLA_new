@@ -53,6 +53,7 @@ class DeploymentDiagnosticsTests(unittest.TestCase):
                 robot.q += .004  # The startup drift that used to fail parity checks.
 
         namespace = dict(np=np, math=math, robot=robot, timeline=timeline,
+                         sync_physics_to_usd=lambda: None,
                          simulation_app=SimpleNamespace(update=render_update),
                          ArticulationAction=lambda **kwargs: kwargs, print=lambda *args, **kwargs: None)
         exec(compile(ast.Module(body=[restore], type_ignores=[]), '<restore>', 'exec'), namespace)

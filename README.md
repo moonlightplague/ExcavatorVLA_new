@@ -194,12 +194,18 @@ not a measure of generalization or simulator success.
 
 ## Evaluate current 28D success rate
 
-Requires a working Isaac Sim GUI/display. Each episode starts a fresh simulator.
+Runs headlessly by default. It automatically uses one persistent evaluation
+worker per visible GPU, capped by the episode count. Each worker loads the
+policy and Isaac Sim once, then resets the robot, truck, sand and observation
+history in place between episodes. Camera pipelines, particle systems, materials
+and the USD stage stay loaded.
 
 ```bash
 cd "$BASE"
 # Checkpoint, episodes, maximum policy steps, minimum deposited particles
 bash eval_smolvla_success.sh outputs/train/<run>/checkpoints/last/pretrained_model 10 350 100
+# Throughput run on both GPUs, without recording videos
+bash eval_smolvla_success.sh outputs/train/<run>/checkpoints/last/pretrained_model 100 350 100 --gpus 0,1 --no-video
 ```
 
 Uses the existing `ExcavatorVLA-smolvla/run_simulation.py` lockstep simulator,
@@ -216,10 +222,34 @@ can admit a long truck that physically locks the swing joint.
 Success follows the old rule: deposited particles meet the threshold and do
 not increase for 3 observations. An open bucket ends the successful episode.
 The default threshold is the old value of 1 particle; the example uses 100.
-Runtime errors are reported separately and stop the batch.
+Runtime errors are reported separately and stop the batch, including the other
+workers. Episode indices and seeds are independent of worker count: episode N
+always uses `--seed + N - 1`.
+
+Physics still advances at 60 Hz and actions run at dataset FPS; intermediate
+physics ticks do not render. All three policy cameras still render at the
+collection resolution of 1024x1024 before downsampling to 256x256. Videos remain
+enabled by default. `--no-video` disables the overview render and MP4 encoding.
+CPU thread budgets account for the container's CPU quota. Each GPU gets its own
+persistent writable shader cache, seeded from the installation's existing cache
+when available, to avoid simultaneous shader-cache writers. Override its root
+with `EXCAVATOR_EVAL_CACHE` if needed.
+
+Use `--workers 1 --gpus 0` to restrict resources or `CUDA_VISIBLE_DEVICES` to limit
+the allowed GPUs. `--no-headless` shows one simulator and selects one worker;
+its GPU must support presenting windows on the current display. Multiple workers
+use headless rendering. For comparison with
+the previous lifecycle/rendering behavior, use
+`--workers 1 --fresh-simulator --render-every-physics-step --no-headless`.
 
 Results: `outputs/eval/success_*/success_rate_summary.json`, `episode_results.csv`,
-and per-episode logs/action traces. Every evaluated episode also saves
+and per-episode logs/action traces. `runtime.json` records batch wall time,
+GPU assignments and worker exit codes. Worker and Kit logs are under
+`workers/worker_XX/`; each episode's `simulator.log` links to its worker log.
+Episode status files include simulator process IDs, reuse status, and startup
+or reset time. The legacy `*_from_simulation_launch_seconds` fields include
+the current episode's startup or reset; `timing_origin` identifies this origin.
+With videos enabled, every evaluated episode also saves
 `episodes/episode_XXXX/evaluation.mp4`: a fixed overview plus the three policy
 cameras, with step count, deposited particles, bucket state, and result text.
 Videos play at dataset FPS (simulation time) and hold the final result for two
