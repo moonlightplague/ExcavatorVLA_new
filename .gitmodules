@@ -1,7 +1,7 @@
 [submodule "ExcavatorVLA"]
 	path = ExcavatorVLA
 	url = https://github.com/moonlightplague/ExcavatorVLA.git
-	branch = main
+	branch = vlm
 [submodule "ExcavatorVLA-isaac"]
 	path = ExcavatorVLA-isaac
 	url = https://github.com/moonlightplague/ExcavatorVLA.git
