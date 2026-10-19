@@ -243,7 +243,38 @@ the previous lifecycle/rendering behavior, use
 `--workers 1 --fresh-simulator --render-every-physics-step --no-headless`.
 
 Results: `outputs/eval/success_*/success_rate_summary.json`, `episode_results.csv`,
-and per-episode logs/action traces. `runtime.json` records batch wall time,
+and per-episode logs/action traces. Each new evaluation also records these metrics
+in `episode_status.json` and CSV, with numeric distributions and failure-mode
+counts in the summary JSON:
+
+| Metric | Definition |
+| --- | --- |
+| Payload | `payload_particles`: source particles in the truck, excluding particles already deposited at the initial observation. |
+| Spillage | `spillage_particles` and `spillage_fraction`: unique source particles observed in the bucket that are now outside both bucket and truck, divided by `scooped_particles`. Material still retained is reported separately. The fraction is null if nothing was scooped. |
+| Cycle time | `cycle_time_seconds`: simulated action time until success and bucket open; null for an incomplete cycle. `cycle_time_wall_seconds` reports wall time. Failed rollouts still report `simulated_rollout_time_seconds`. |
+| Failure mode | `none`, `no_payload`, `lost_payload`, `insufficient_payload`, `unstable_deposit`, `bucket_not_open`, or `infrastructure_error`. Invalid rollout validation is `validation_error`. |
+| Latency | `policy_latency_ms_mean/p50/p95/max` measures each actual replan, including image preparation, preprocessing, model execution, postprocessing and CPU action transfer. Bridge round-trip and complete control-step mean/p95 are also recorded. Cached actions and expert replay have no model latency samples. |
+| FPS | `fps`: executed policy actions per rollout wall second, including trace/video writing. Startup/reset, the initial zero-action observation and the final video hold are excluded. This is measured throughput; dataset FPS remains the simulation cadence. |
+
+Particle metrics use initial-pile particle identities sampled once per returned
+observation, independently of the bucket-load fallback used by the policy.
+Spillage includes particles returned to the pile or still in flight at termination;
+recovered particles cease to count as spilled. Transfers entirely between
+observations are not observed. Payload and spillage use particle counts. Cycle time
+excludes the initial zero-action observation and sums actual simulator step
+durations, so it also supports policy rates that do not divide 60 Hz evenly.
+Failure classification uses the final payload and task state: `lost_payload`
+requires spillage with no delivered or retained material; `no_payload` also covers
+material still retained with nothing delivered. A deposit meeting the threshold
+without satisfying the existing stability rule is `unstable_deposit`. A stable
+success with a closed bucket is `bucket_not_open`, even though it counts toward
+the existing success rate. Historical status files remain readable; measurements
+they did not record stay null and their failure mode may be `unclassified`.
+Summary numeric distributions cover completed episodes; failure-mode counts also
+include infrastructure/validation errors. Latency summaries aggregate episode
+statistics, rather than pooling step samples across episodes.
+
+`runtime.json` records batch wall time,
 GPU assignments and worker exit codes. Worker and Kit logs are under
 `workers/worker_XX/`; each episode's `simulator.log` links to its worker log.
 Episode status files include simulator process IDs, reuse status, and startup

@@ -1,4 +1,4 @@
-"""Evaluate 28D policy success with persistent, GPU-isolated Isaac workers."""
+"""Evaluate 28D policy success, material transfer and timing with persistent Isaac workers."""
 import argparse
 import json
 from pathlib import Path
@@ -21,6 +21,7 @@ from excavator_common.deployment_contract import (
     build_client_contract, OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT, STATE_NAMES_28D,
     ACTION_NAMES_4D, sha256_files,
 )
+from excavator_common.evaluation_metrics import EpisodeMetrics, METRIC_DEFINITIONS, failure_mode
 from summarize_isaacsim_success_rate import load_episode_rows, build_summary, write_outputs
 from eval_video import EpisodeVideo
 from success_eval_runtime import (
@@ -144,6 +145,7 @@ def main():
     config.update(training_fps=info['fps'], supervisor=False, bucket_open_threshold=-0.80,
                   success_no_growth_steps=3, simulator=str(REPO / 'run_simulation.py'),
                   initial_joints_deg=initial_pose, execution_source='expert_replay' if args.replay_reference else 'model')
+    config['metric_definitions'] = METRIC_DEFINITIONS
     if args.worker_index is None:
         args.output.mkdir(parents=True, exist_ok=False)
         atomic_json(args.output / 'config.json', config)
@@ -217,6 +219,9 @@ def run_episodes(args, info, reference, action_limits, policy,
                   'policy_steps_inferred': 0, 'policy_steps_executed': 0,
                   'early_terminated': False, 'error': None, 'scene_seed': args.seed + index - 1}
         status.update(worker_index=args.worker_index, gpu_id=args.gpu_label)
+        status.update(min_particles=args.min_particles, execution_source=config['execution_source'])
+        metrics = EpisodeMetrics()
+        policy_start = None
         status['timing_origin'] = 'episode_preparation_start'
         video = (EpisodeVideo(folder / 'evaluation.mp4', index, status['scene_seed'],
                               info['fps'], args.steps, args.min_particles) if args.video else None)
@@ -250,6 +255,7 @@ def run_episodes(args, info, reference, action_limits, policy,
                 if reference and np.max(np.abs(initial_report['reference_state_error'][16:26])) > 0.05:
                     raise ValueError('Reference scene geometry differs by more than 0.05 from collection; see initial_observation.json')
                 baseline = deposited_count(reply)
+                metrics.observe(reply)
                 status.update(initial_deposited_particle_count=baseline,
                               initial_bucket_particle_count=int(reply['bucket_load_metrics']['count']))
                 previous = stable_steps = 0
@@ -261,6 +267,8 @@ def run_episodes(args, info, reference, action_limits, policy,
                 actions = []
                 policy_start = time.monotonic()
                 for step in range(args.steps):
+                    step_started = time.perf_counter()
+                    policy_latency_ms = None
                     # Validate every returned observation, including between replans.
                     input_state = validate_state(reply).tolist()
                     if args.replay_reference:
@@ -269,18 +277,28 @@ def run_episodes(args, info, reference, action_limits, policy,
                             break
                         actions = [reference['actions'][step]]
                     elif not actions:
+                        inference_started = time.perf_counter()
                         batch = observation(reply)
                         with torch.inference_mode():
                             chunk = policy.predict_action_chunk(preprocess(batch))
                             actions = [postprocess(chunk[:, i]).cpu().numpy()[0]
                                        for i in range(min(args.replan_interval, chunk.shape[1]))]
+                        # CPU action transfer above waits for CUDA completion.
+                        policy_latency_ms = (time.perf_counter() - inference_started) * 1000
+                        metrics.policy_ms.append(policy_latency_ms)
                         status['policy_steps_inferred'] += len(actions)
                     predicted = actions.pop(0)
                     if predicted.shape != (4,) or not np.isfinite(predicted).all():
                         raise ValueError('Invalid model action')
                     applied = np.clip(predicted, -action_limits, action_limits)
+                    bridge_started = time.perf_counter()
                     reply = exchange(sock, {'joint_velocities': applied.tolist()})
+                    bridge_latency_ms = (time.perf_counter() - bridge_started) * 1000
                     validate_state(reply)
+                    step_latency_ms = (time.perf_counter() - step_started) * 1000
+                    metrics.observe(reply, action_step=True)
+                    metrics.bridge_ms.append(bridge_latency_ms)
+                    metrics.step_ms.append(step_latency_ms)
                     count = max(0, deposited_count(reply) - baseline)
                     stable_steps, success = update_success(count, previous, stable_steps, args.min_particles)
                     previous = count
@@ -299,7 +317,11 @@ def run_episodes(args, info, reference, action_limits, policy,
                                             'input_state': input_state, 'state': reply['observation_state_28d'],
                                             'joint_command_positions': reply['joint_command_positions'],
                                             'deposited_particles': count, 'stable_steps': stable_steps,
-                                            'bucket_position': bucket_q, 'bridge_timing': reply['bridge_timing']}) + '\n')
+                                            'bucket_position': bucket_q, 'bridge_timing': reply['bridge_timing'],
+                                            'particle_transfer_metrics': reply['particle_transfer_metrics'],
+                                            'policy_latency_ms': policy_latency_ms,
+                                            'bridge_latency_ms': bridge_latency_ms,
+                                            'step_latency_ms': step_latency_ms}) + '\n')
                     trace.flush()
                     if video is not None:
                         video.write(reply, {**status, 'status': 'running'}, stable_steps)
@@ -317,9 +339,13 @@ def run_episodes(args, info, reference, action_limits, policy,
                     'supervisor_enabled': False, 'action_velocity_limits': action_limits.tolist(),
                 }, indent=2))
         except Exception as exc:
-            status['error'] = f'{type(exc).__name__}: {exc}'
+            status.update(status='error', error=f'{type(exc).__name__}: {exc}')
             failed = True
         finally:
+            if policy_start is not None:
+                status.setdefault('rollout_time_from_policy_start_seconds', time.monotonic() - policy_start)
+                status.setdefault('rollout_time_from_simulation_launch_seconds', time.monotonic() - started)
+            metrics.finalize(status, status.get('rollout_time_from_policy_start_seconds'))
             if video is not None:
                 try:
                     video.finish(status)
@@ -329,10 +355,17 @@ def run_episodes(args, info, reference, action_limits, policy,
                     status.update(status='error', error=status['video_error'])
                     print(f"Episode {index} video error: {status['video_error']}", flush=True)
                     failed = True
+            if status['status'] != 'completed':
+                status.update(cycle_time_seconds=None, cycle_time_wall_seconds=None)
+            status['failure_mode'] = failure_mode(status)
             atomic_json(folder / 'episode_status.json', status)
             if args.fresh_simulator or failed:
                 session.close()
-        print(f"Episode {index}: {status['status']}, success={status['success']}, error={status['error']}", flush=True)
+        print(f"Episode {index}: {status['status']}, success={status['success']}, "
+              f"payload={status['payload_particles']}, spillage={status['spillage_particles']}, "
+              f"cycle_s={status['cycle_time_seconds']}, failure_mode={status['failure_mode']}, "
+              f"latency_ms={status['policy_latency_ms_mean']}, fps={status['fps']}, "
+              f"error={status['error']}", flush=True)
         if failed:
             raise SystemExit(1)
 

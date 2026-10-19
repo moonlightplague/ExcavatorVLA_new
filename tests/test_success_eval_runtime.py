@@ -1,5 +1,7 @@
 """Test GPU isolation, episode assignment and process cleanup without Isaac."""
 from pathlib import Path
+from contextlib import redirect_stdout
+from io import StringIO
 import signal
 import subprocess
 import sys
@@ -76,6 +78,7 @@ class SimulatorLifecycleTests(unittest.TestCase):
                 self.assertEqual(first['simulator_pid'], second['simulator_pid'])
                 launch.assert_called_once()
                 self.assertEqual(launch.call_args.kwargs['env']['EXCAVATOR_EVAL_VIDEO'], '0')
+                self.assertEqual(launch.call_args.kwargs['env']['EXCAVATOR_EVAL_METRICS'], '1')
                 exchange.assert_called_once_with(sock, {'type': 'reset_episode', 'scene_seed': 9})
                 session.close()
                 session.close()
@@ -117,6 +120,21 @@ class SimulatorLifecycleTests(unittest.TestCase):
 
 
 class WorkerLifecycleTests(unittest.TestCase):
+    def test_parent_reports_new_metrics_from_completed_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(episodes=1, workers=1, cpu_threads=2, output=Path(directory))
+            process = Mock(returncode=0)
+            process.poll.return_value = 0
+            row = dict(episode_index=1, status='completed', success=True, error=None,
+                       payload_particles=50, spillage_particles=5, cycle_time_seconds=10,
+                       failure_mode='none', policy_latency_ms_mean=20, fps=3)
+            output = StringIO()
+            with patch.object(runtime.subprocess, 'Popen', return_value=process), redirect_stdout(output):
+                code = runtime.run_workers(args, Path('evaluate.py'), ['GPU-a'], lambda: [row])
+            self.assertEqual(code, 0)
+            self.assertIn('payload=50, spillage=5, cycle_s=10', output.getvalue())
+            self.assertIn('failure_mode=none, policy_latency_ms=20, fps=3', output.getvalue())
+
     def test_worker_error_stops_other_workers_and_records_incomplete_batch(self):
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(episodes=4, workers=0, cpu_threads=2, output=Path(directory))

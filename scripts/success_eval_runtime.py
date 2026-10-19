@@ -134,7 +134,8 @@ class SimulatorSession:
                 probe.bind(('127.0.0.1', 0))
                 port = probe.getsockname()[1]
             env = dict(os.environ, EXCAVATOR_PROJECT_ROOT=str(self.cwd),
-                       EXCAVATOR_BRIDGE_PORT=str(port), EXCAVATOR_EVAL_VIDEO=str(int(self.video)))
+                       EXCAVATOR_BRIDGE_PORT=str(port), EXCAVATOR_EVAL_VIDEO=str(int(self.video)),
+                       EXCAVATOR_EVAL_METRICS='1')
             gpu = env.get('CUDA_VISIBLE_DEVICES', 'default')
             cache_root = prepare_shader_cache(self.cwd, gpu, env)
             driver_cache = cache_root / 'driver'
@@ -198,7 +199,11 @@ def run_workers(args, entrypoint, gpu_ids, summarize):
                 index = row['episode_index']
                 if index not in reported:
                     print(f"Episode {index}/{args.episodes}: {row['status']}, "
-                          f"success={row['success']}, error={row['error']}", flush=True)
+                          f"success={row['success']}, payload={row.get('payload_particles')}, "
+                          f"spillage={row.get('spillage_particles')}, cycle_s={row.get('cycle_time_seconds')}, "
+                          f"failure_mode={row.get('failure_mode')}, "
+                          f"policy_latency_ms={row.get('policy_latency_ms_mean')}, fps={row.get('fps')}, "
+                          f"error={row['error']}", flush=True)
                     reported.add(index)
             codes = [process.poll() for process in processes]
             if any(code is not None and code != 0 for code in codes):
