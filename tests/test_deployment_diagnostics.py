@@ -63,6 +63,8 @@ class DeploymentDiagnosticsTests(unittest.TestCase):
         self.assertFalse(timeline.playing)
         np.testing.assert_array_equal(robot.q, snapshot['joint_positions'])
 
+    @unittest.skipUnless((BASE / 'data/raw/run_20261012_133855/episode_000002/meta.json').is_file(),
+                         'Archived raw reference episode is not installed')
     def test_reference_replay_uses_the_actual_exported_action_alignment(self):
         reference = reference_episode(BASE / 'data/raw/run_20261012_133855/episode_000002', 10)
         data = pd.read_parquet(BASE / 'data/export/data/chunk-000/file-000.parquet')

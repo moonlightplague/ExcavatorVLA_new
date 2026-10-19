@@ -1,5 +1,6 @@
 """Process and GPU lifecycle for success evaluation (no ML/Isaac imports)."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -7,6 +8,46 @@ import shutil
 import socket
 import subprocess
 import time
+
+
+def file_manifest(paths, root):
+    result = {}
+    for path in sorted(set(paths)):
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(block)
+        result[str(path.relative_to(root))] = digest.hexdigest()
+    return result
+
+
+def content_id(payload):
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def evaluation_provenance(base, checkpoint, dataset, protocol, software):
+    simulator = base / 'ExcavatorVLA-smolvla'
+    sources = [*simulator.glob('excavator_common/*.py'), simulator / 'run_simulation.py',
+               simulator / 'scripts/excavator_app/sand_site_runtime.py',
+               simulator / 'scripts/evaluation/summarize_isaacsim_success_rate.py',
+               *[base / 'scripts' / name for name in (
+                   'eval_smolvla_success.py', 'success_eval_runtime.py', 'eval_video.py',
+                   'excavator_diagnostics.py')],
+               base / 'ExcavatorVLA-isaac/assets/usd/excavator_scene.usd', base / 'run_isaac_python.sh']
+    checkpoint_files = file_manifest([p for p in checkpoint.rglob('*') if p.is_file()], checkpoint)
+    source_files = file_manifest(sources, base)
+    metadata = file_manifest([dataset / 'meta/info.json'], dataset)
+    software = dict(software)
+    isaac_dir = Path(os.environ.get('EXCAVATOR_ISAAC_DIR', str(base / 'isaacsim'))).resolve()
+    software['isaac_version'] = (isaac_dir / 'VERSION').read_text().strip()
+    software['gpu_inventory'] = subprocess.run(
+        ['nvidia-smi', '--query-gpu=uuid,name,driver_version', '--format=csv,noheader'],
+        check=True, capture_output=True, text=True).stdout.strip().splitlines()
+    manifest = dict(checkpoint_files=checkpoint_files, source_files=source_files,
+                    dataset_metadata=metadata, software=software, protocol=protocol)
+    manifest['checkpoint_sha256'] = content_id(checkpoint_files)
+    manifest['evaluation_id'] = content_id(manifest)
+    return manifest
 
 
 def atomic_json(path, payload):
@@ -136,14 +177,19 @@ class SimulatorSession:
             env = dict(os.environ, EXCAVATOR_PROJECT_ROOT=str(self.cwd),
                        EXCAVATOR_BRIDGE_PORT=str(port), EXCAVATOR_EVAL_VIDEO=str(int(self.video)),
                        EXCAVATOR_EVAL_METRICS='1')
+            collection_scene = self.cwd.parent / 'ExcavatorVLA-isaac/assets/usd/excavator_scene.usd'
+            if collection_scene.is_file():
+                env['EXCAVATOR_COLLECTION_SCENE'] = str(collection_scene)
             gpu = env.get('CUDA_VISIBLE_DEVICES', 'default')
             cache_root = prepare_shader_cache(self.cwd, gpu, env)
             driver_cache = cache_root / 'driver'
             env['__GL_SHADER_DISK_CACHE_PATH'] = str(driver_cache)
             self.log = self.log_path.open('a')
+            self.log.write(f'\n=== Starting fresh episode: seed={seed} ===\n')
+            self.log.flush()
             self.process = subprocess.Popen(
                 [*self.command, '--scene-seed', str(seed), '--kit-log',
-                 str(self.log_path.with_name('kit.log')), '--shader-cache', str(cache_root)],
+                 str(self.log_path.with_name(f'kit_seed_{seed}.log')), '--shader-cache', str(cache_root)],
                 cwd=self.cwd, env=env,
                 stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True,
             )
@@ -185,13 +231,13 @@ def run_workers(args, entrypoint, gpu_ids, summarize):
             log = (worker_dir / 'worker.log').open('w')
             logs.append(log)
             env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu, TOKENIZERS_PARALLELISM='false', PYTHONUNBUFFERED='1',
-                       OMP_NUM_THREADS=str(min(4, cpu_threads)), MKL_NUM_THREADS=str(min(4, cpu_threads)))
+                       OMP_NUM_THREADS='4', MKL_NUM_THREADS='4', CUBLAS_WORKSPACE_CONFIG=':4096:8')
             command = [os.sys.executable, str(entrypoint), *os.sys.argv[1:],
                        '--worker-index', str(index), '--worker-count', str(worker_count),
                        '--cpu-threads', str(cpu_threads), '--gpu-label', gpu]
             processes.append(subprocess.Popen(command, env=env, stdout=log,
                                               stderr=subprocess.STDOUT, start_new_session=True))
-        print(f'Evaluating {args.episodes} episodes with {worker_count} persistent GPU workers '
+        print(f'Evaluating {args.episodes} episodes with {worker_count} policy workers '
               f'({cpu_threads} simulator CPU threads each).', flush=True)
         while True:
             rows = summarize()

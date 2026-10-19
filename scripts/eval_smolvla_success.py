@@ -1,7 +1,11 @@
-"""Evaluate 28D policy success, material transfer and timing with persistent Isaac workers."""
+"""Evaluate the versioned excavation task with isolated scenes and auditable scoring."""
 import argparse
+import hashlib
+import importlib.metadata
 import json
+import os
 from pathlib import Path
+import random
 import signal
 import sys
 import time
@@ -10,7 +14,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from lerobot.policies.factory import make_pre_post_processors
-from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.factory import get_policy_class
 
 BASE = Path(__file__).resolve().parents[1]
 REPO = BASE / 'ExcavatorVLA-smolvla'
@@ -22,10 +27,15 @@ from excavator_common.deployment_contract import (
     ACTION_NAMES_4D, sha256_files,
 )
 from excavator_common.evaluation_metrics import EpisodeMetrics, METRIC_DEFINITIONS, failure_mode
+from excavator_common.evaluation_standard import (
+    EVALUATION_STANDARD, TRUCK_COUNT_METHOD, BUCKET_OPEN_RAD, COMPLETION_OBSERVATIONS,
+    CompletionTracker, execution_profile,
+)
 from summarize_isaacsim_success_rate import load_episode_rows, build_summary, write_outputs
 from eval_video import EpisodeVideo
 from success_eval_runtime import (
     SimulatorSession, atomic_json, episode_indices, resolve_gpu_ids, run_workers,
+    evaluation_provenance,
 )
 from excavator_diagnostics import dataset_initial_pose, reference_episode
 
@@ -41,14 +51,20 @@ def exchange(sock, command):
 def deposited_count(reply):
     metric = reply['truck_bed_load_metrics']
     if (not metric['available'] or not metric['source_tracking_valid']
-            or metric['method'] != 'world_aabb_excluding_bucket_v2'):
+            or metric['method'] != TRUCK_COUNT_METHOD):
         raise ValueError(f'Invalid truck load metric: {metric}')
     return int(metric['count'])
 
 
-def update_success(count, previous, stable_steps, minimum):
-    stable_steps = stable_steps + 1 if count >= minimum and previous >= minimum and count <= previous else 0
-    return stable_steps, count >= minimum and stable_steps >= 3
+def validate_scene_metric(reply, scene_seed):
+    deposited_count(reply)
+    if reply['truck_bed_load_metrics'].get('scene_seed') != scene_seed:
+        raise ValueError('Truck counting volume belongs to a different scene')
+
+
+def image_hashes(reply):
+    return {key: hashlib.sha256(value.tobytes()).hexdigest()
+            for key, value in decode_camera_images(reply, np_module=np).items()}
 
 
 def validate_state(reply):
@@ -81,11 +97,12 @@ def observation(reply):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--policy-type', choices=['smolvla', 'act', 'pi05'], default='smolvla')
     parser.add_argument('--dataset', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--episodes', type=int, default=1)
     parser.add_argument('--steps', type=int, default=350)
-    parser.add_argument('--min-particles', type=int, default=1)
+    parser.add_argument('--min-particles', type=int, default=100)
     parser.add_argument('--seed', type=int, default=2)
     parser.add_argument('--replan-interval', type=int, default=3)
     parser.add_argument('--initial-episode', type=int, default=0,
@@ -95,14 +112,14 @@ def main():
     parser.add_argument('--replay-reference', action='store_true',
                         help='Execute reference expert actions instead of model actions to test the simulator.')
     parser.add_argument('--workers', type=int, default=0,
-                        help='Persistent workers; 0 uses one per visible GPU (capped by episodes).')
+                        help='Policy workers; 0 uses one per visible GPU (capped by episodes).')
     parser.add_argument('--gpus', help='Physical GPU indices or UUIDs, e.g. 0,1; respects CUDA_VISIBLE_DEVICES.')
     parser.add_argument('--headless', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--video', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--fresh-simulator', action='store_true',
-                        help='Restart Isaac every episode for reset/parity diagnosis.')
-    parser.add_argument('--render-every-physics-step', action='store_true',
-                        help='Render intermediate physics ticks for comparison with the old evaluator.')
+    parser.add_argument('--fresh-simulator', action=argparse.BooleanOptionalAction, default=True,
+                        help='Start a fresh Isaac scene per episode (standard). Disabling is diagnostic.')
+    parser.add_argument('--render-every-physics-step', action=argparse.BooleanOptionalAction, default=True,
+                        help='Render all physics ticks (standard). Disabling is diagnostic.')
     parser.add_argument('--cpu-threads', type=int, default=0,
                         help='Simulator CPU threads per worker; 0 splits the available CPU quota.')
     parser.add_argument('--startup-timeout', type=float, default=600)
@@ -114,11 +131,17 @@ def main():
         parser.error('Episode, step, particle and replanning counts must be positive')
     if args.workers < 0 or args.cpu_threads < 0 or args.startup_timeout <= 0:
         parser.error('Worker/thread counts must be nonnegative and startup timeout positive')
+    if not np.isfinite(args.startup_timeout) or args.seed < 0 or args.seed + args.episodes > 2**63:
+        parser.error('Timeout must be finite and scene seeds must fit nonnegative signed 64-bit integers')
     if not args.headless:
         if args.workers > 1:
             parser.error('Multiple GPU workers require headless mode; use --workers 1 for a GUI')
         args.workers = 1
     args.checkpoint = args.checkpoint.resolve()
+    if args.policy_type == 'pi05':
+        sys.path.insert(0, str(BASE / 'ExcavatorVLA-vlm'))
+        from excavator_vlm.policies.pi05.checkpoints import resolve_checkpoint
+        args.checkpoint = resolve_checkpoint(args.checkpoint)
     args.dataset = args.dataset.resolve()
     args.output = args.output.resolve()
     if not args.checkpoint.is_dir():
@@ -142,13 +165,30 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
               if k not in ('worker_index', 'worker_count', 'gpu_label')}
-    config.update(training_fps=info['fps'], supervisor=False, bucket_open_threshold=-0.80,
-                  success_no_growth_steps=3, simulator=str(REPO / 'run_simulation.py'),
+    config.update(training_fps=info['fps'], supervisor=False, bucket_open_threshold=BUCKET_OPEN_RAD,
+                  completion_observations=COMPLETION_OBSERVATIONS, simulator=str(REPO / 'run_simulation.py'),
                   initial_joints_deg=initial_pose, execution_source='expert_replay' if args.replay_reference else 'model')
+    config.update(evaluation_standard=EVALUATION_STANDARD, truck_count_method=TRUCK_COUNT_METHOD,
+                  evaluation_profile=execution_profile(args.fresh_simulator, args.render_every_physics_step,
+                                                       args.headless, reference is not None))
     config['metric_definitions'] = METRIC_DEFINITIONS
     if args.worker_index is None:
         args.output.mkdir(parents=True, exist_ok=False)
+        protocol = {key: config[key] for key in (
+            'evaluation_standard', 'evaluation_profile', 'policy_type', 'truck_count_method',
+            'episodes', 'steps', 'min_particles', 'seed', 'replan_interval', 'training_fps',
+            'initial_joints_deg', 'bucket_open_threshold', 'completion_observations',
+            'fresh_simulator', 'render_every_physics_step', 'headless', 'execution_source')}
+        software = {'python': sys.version, 'torch': torch.__version__, 'cuda': torch.version.cuda}
+        for package in ('lerobot', 'transformers', 'numpy', 'pillow'):
+            software[package] = importlib.metadata.version(package)
+        provenance = evaluation_provenance(BASE, args.checkpoint, args.dataset, protocol, software)
+        atomic_json(args.output / 'provenance.json', provenance)
+        config.update({key: provenance[key] for key in ('evaluation_id', 'checkpoint_sha256')})
         atomic_json(args.output / 'config.json', config)
+    else:
+        saved_config = json.loads((args.output / 'config.json').read_text())
+        config.update({key: saved_config[key] for key in ('evaluation_id', 'checkpoint_sha256')})
     if reference and args.worker_index is None:
         (args.output / 'scene_profile.json').write_text(json.dumps(reference['profile'], indent=2) + '\n')
     if args.worker_index is None:
@@ -171,18 +211,45 @@ def main():
             print('Evaluation incomplete; see workers/worker_*/worker.log and simulator.log.', flush=True)
         raise SystemExit(code)
 
-    torch.set_num_threads(min(4, args.cpu_threads or 4))
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    torch.set_num_threads(4)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     policy = None
     if not args.replay_reference:
-        policy = SmolVLAPolicy.from_pretrained(str(args.checkpoint)).to('cuda').eval()
+        if args.policy_type == 'pi05':
+            from excavator_vlm.policies.pi05.inference import load_pi05
+            policy, preprocess, postprocess = load_pi05(args.checkpoint, 'cuda')
+            policy_config = policy.config
+        else:
+            policy_config = PreTrainedConfig.from_pretrained(str(args.checkpoint))
+        if policy_config.type != args.policy_type:
+            raise ValueError('Checkpoint policy type differs from --policy-type')
+        policy_config.device = 'cuda'
+        if args.policy_type == 'act':
+            policy_config.pretrained_backbone_weights = None
+            if policy_config.temporal_ensemble_coeff is not None:
+                raise ValueError('Shared evaluator executes chunks; ACT temporal ensembling must be disabled')
+        if args.replan_interval > policy_config.chunk_size:
+            raise ValueError('Replan interval cannot exceed checkpoint chunk size')
+        if args.policy_type != 'pi05':
+            policy = get_policy_class(args.policy_type).from_pretrained(
+                str(args.checkpoint), config=policy_config,
+                strict=True, local_files_only=True).to('cuda').eval()
         if list(policy.config.input_features['observation.state'].shape) != [28]:
             raise ValueError('Expected a 28D checkpoint')
         if list(policy.config.output_features['action'].shape) != [4]:
             raise ValueError('Expected a 4D action checkpoint')
-        preprocess, postprocess = make_pre_post_processors(
-            policy.config, pretrained_path=str(args.checkpoint),
-            preprocessor_overrides={'device_processor': {'device': 'cuda'}},
-        )
+        if list(policy.config.image_features) != [f'observation.images.{i}' for i in range(3)]:
+            raise ValueError('Expected the three canonical camera keys in order')
+        if args.policy_type != 'pi05':
+            preprocess, postprocess = make_pre_post_processors(
+                policy.config, pretrained_path=str(args.checkpoint),
+                preprocessor_overrides={'device_processor': {'device': 'cuda'}},
+            )
     worker_dir = args.output / 'workers' / f'worker_{args.worker_index:02d}'
     command = [str(BASE / 'run_isaac_python.sh'), str(REPO / 'run_simulation.py'),
                '--sand-amount', str(reference['sand_amount'] if reference else 1),
@@ -220,6 +287,10 @@ def run_episodes(args, info, reference, action_limits, policy,
                   'early_terminated': False, 'error': None, 'scene_seed': args.seed + index - 1}
         status.update(worker_index=args.worker_index, gpu_id=args.gpu_label)
         status.update(min_particles=args.min_particles, execution_source=config['execution_source'])
+        status.update({key: config[key] for key in (
+            'evaluation_standard', 'evaluation_profile', 'evaluation_id', 'checkpoint_sha256')})
+        status.update(policy_type=getattr(args, 'policy_type', 'smolvla'),
+                      clipped_action_dimensions=0, applied_action_dimensions=0)
         metrics = EpisodeMetrics()
         policy_start = None
         status['timing_origin'] = 'episode_preparation_start'
@@ -227,6 +298,8 @@ def run_episodes(args, info, reference, action_limits, policy,
                               info['fps'], args.steps, args.min_particles) if args.video else None)
         status['video_path'] = str(video.path) if video is not None else None
         torch.manual_seed(status['scene_seed'])
+        random.seed(status['scene_seed'])
+        np.random.seed(status['scene_seed'] % (2**32))
         started = time.monotonic()
         try:
             status.update(session.prepare(status['scene_seed']))
@@ -247,8 +320,11 @@ def run_episodes(args, info, reference, action_limits, policy,
                     raise ValueError(f'Invalid deployment handshake: {ack}')
                 (folder / 'contract.json').write_text(json.dumps({'request': contract, 'reply': ack}, indent=2))
                 reply = exchange(sock, {'joint_velocities': [0.0] * 4})
+                validate_scene_metric(reply, status['scene_seed'])
                 initial_state = validate_state(reply)
-                initial_report = {'state': initial_state.tolist(), 'task': reply['task_text']}
+                initial_report = {'state': initial_state.tolist(), 'task': reply['task_text'],
+                                  'camera_sha256': image_hashes(reply),
+                                  'truck_bed_load_metrics': reply['truck_bed_load_metrics']}
                 if reference:
                     initial_report['reference_state_error'] = (initial_state - reference['expected_initial_state']).tolist()
                 (folder / 'initial_observation.json').write_text(json.dumps(initial_report, indent=2) + '\n')
@@ -258,7 +334,7 @@ def run_episodes(args, info, reference, action_limits, policy,
                 metrics.observe(reply)
                 status.update(initial_deposited_particle_count=baseline,
                               initial_bucket_particle_count=int(reply['bucket_load_metrics']['count']))
-                previous = stable_steps = 0
+                completion = CompletionTracker(args.min_particles)
                 if video is not None:
                     video.write(reply, {**status, 'status': 'running',
                                         'final_bucket_open': float(reply['joint_positions'][3]) >= -0.80})
@@ -291,21 +367,29 @@ def run_episodes(args, info, reference, action_limits, policy,
                     if predicted.shape != (4,) or not np.isfinite(predicted).all():
                         raise ValueError('Invalid model action')
                     applied = np.clip(predicted, -action_limits, action_limits)
+                    status['clipped_action_dimensions'] += int(np.count_nonzero(applied != predicted))
+                    status['applied_action_dimensions'] += len(applied)
                     bridge_started = time.perf_counter()
                     reply = exchange(sock, {'joint_velocities': applied.tolist()})
                     bridge_latency_ms = (time.perf_counter() - bridge_started) * 1000
                     validate_state(reply)
+                    validate_scene_metric(reply, status['scene_seed'])
                     step_latency_ms = (time.perf_counter() - step_started) * 1000
                     metrics.observe(reply, action_step=True)
                     metrics.bridge_ms.append(bridge_latency_ms)
                     metrics.step_ms.append(step_latency_ms)
-                    count = max(0, deposited_count(reply) - baseline)
-                    stable_steps, success = update_success(count, previous, stable_steps, args.min_particles)
-                    previous = count
+                    # Identity exclusion handles initial deposits leaving/re-entering;
+                    # subtracting a scalar initial count cannot do that correctly.
+                    count = metrics.transfer['payload_particles']
+                    if count > deposited_count(reply):
+                        raise ValueError('Identity payload exceeds current truck count')
                     bucket_q = float(reply['joint_positions'][3])
-                    bucket_open = bucket_q >= -0.80
+                    bucket_open = bucket_q >= BUCKET_OPEN_RAD
+                    success = completion.observe(count, bucket_q)
+                    stable_steps = completion.consecutive
                     elapsed = time.monotonic() - policy_start
-                    status.update(success=success, task_completed_success_and_bucket_open=success and bucket_open,
+                    status.update(success=success, task_completed_success_and_bucket_open=success,
+                                  completion_observations=stable_steps,
                                   policy_steps_executed=step + 1, final_newly_deposited_particle_count=count,
                                   final_bucket_position_rad=bucket_q, final_bucket_open=bucket_open,
                                   max_bucket_particles=max(status.get('max_bucket_particles', 0),
@@ -319,6 +403,9 @@ def run_episodes(args, info, reference, action_limits, policy,
                                             'deposited_particles': count, 'stable_steps': stable_steps,
                                             'bucket_position': bucket_q, 'bridge_timing': reply['bridge_timing'],
                                             'particle_transfer_metrics': reply['particle_transfer_metrics'],
+                                            'truck_bed_load_metrics': reply['truck_bed_load_metrics'],
+                                            'camera_sha256': image_hashes(reply),
+                                            'completion_observations': stable_steps,
                                             'policy_latency_ms': policy_latency_ms,
                                             'bridge_latency_ms': bridge_latency_ms,
                                             'step_latency_ms': step_latency_ms}) + '\n')
@@ -338,14 +425,18 @@ def run_episodes(args, info, reference, action_limits, policy,
                     'execution_source': config['execution_source'],
                     'supervisor_enabled': False, 'action_velocity_limits': action_limits.tolist(),
                 }, indent=2))
-        except Exception as exc:
+        except BaseException as exc:
             status.update(status='error', error=f'{type(exc).__name__}: {exc}')
             failed = True
+            if not isinstance(exc, Exception):
+                raise
         finally:
             if policy_start is not None:
                 status.setdefault('rollout_time_from_policy_start_seconds', time.monotonic() - policy_start)
                 status.setdefault('rollout_time_from_simulation_launch_seconds', time.monotonic() - started)
             metrics.finalize(status, status.get('rollout_time_from_policy_start_seconds'))
+            status['clipped_action_fraction'] = (status['clipped_action_dimensions'] /
+                                                 max(1, status['applied_action_dimensions']))
             if video is not None:
                 try:
                     video.finish(status)
@@ -356,7 +447,9 @@ def run_episodes(args, info, reference, action_limits, policy,
                     print(f"Episode {index} video error: {status['video_error']}", flush=True)
                     failed = True
             if status['status'] != 'completed':
-                status.update(cycle_time_seconds=None, cycle_time_wall_seconds=None)
+                status.update(cycle_time_seconds=None, cycle_time_wall_seconds=None,
+                              observed_completion_before_error=bool(status['success']),
+                              success=False, task_completed_success_and_bucket_open=False)
             status['failure_mode'] = failure_mode(status)
             atomic_json(folder / 'episode_status.json', status)
             if args.fresh_simulator or failed:

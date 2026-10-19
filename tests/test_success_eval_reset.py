@@ -70,6 +70,8 @@ class SceneResetTests(unittest.TestCase):
             resolve_state27_dig_target=lambda: ([5, 6, 1], 'new-dig'),
             resolve_state27_unload_target=lambda: ([2, 3, 4], 'new-unload'),
             read_truck_yaw_rad=lambda: .4, hide_sand_source_guides=Mock(),
+            truck_bed_counting_volume={'available': True, 'scene_seed': 2},
+            authored_truck_bed_counting_volume=Mock(return_value={'available': True, 'scene_seed': 9}),
         )
         self.reset = extract(BASE / 'run_simulation.py', 'reset_evaluation_scene', self.namespace)
 
@@ -82,8 +84,23 @@ class SceneResetTests(unittest.TestCase):
         self.particles.GetVelocitiesAttr().Set.assert_called_once_with([0, 0])
         self.assertEqual(self.namespace['world'].step.call_count, 3)
         self.assertEqual(self.namespace['state27_dig_target_world'], [5, 6, 1])
+        self.assertEqual(self.namespace['truck_bed_counting_volume']['scene_seed'], 9)
+        self.namespace['authored_truck_bed_counting_volume'].assert_called_once()
         restores = self.namespace['restore_excavator_pose_after_sand_init'].call_args_list
         self.assertEqual([call.args[0] for call in restores], [self.initial, self.lifted, self.initial])
+
+    def test_each_reset_replaces_truck_bounds_and_rejects_invalid_geometry(self):
+        self.namespace['authored_truck_bed_counting_volume'].side_effect = [
+            {'available': True, 'scene_seed': 9, 'world_min': [10, 0, 0]},
+            {'available': True, 'scene_seed': 12, 'world_min': [-10, 0, 0]},
+            {'available': False, 'reason': 'missing_bed'},
+        ]
+        self.reset(9)
+        self.assertEqual(self.namespace['truck_bed_counting_volume']['world_min'], [10, 0, 0])
+        self.reset(12)
+        self.assertEqual(self.namespace['truck_bed_counting_volume']['world_min'], [-10, 0, 0])
+        with self.assertRaisesRegex(RuntimeError, 'missing_bed'):
+            self.reset(13)
 
     def test_settling_error_restores_robot_before_propagating_failure(self):
         self.namespace['world'].step.side_effect = RuntimeError('physics failed')
@@ -120,6 +137,21 @@ class SceneResetTests(unittest.TestCase):
 
 
 class LockstepPhysicsTests(unittest.TestCase):
+    def test_headless_policy_wait_never_changes_renderer_history(self):
+        tree = ast.parse((BASE / 'run_simulation.py').read_text())
+        branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                      and 'last_idle_ui_update' in ast.unparse(node.test))
+        namespace = dict(args=SimpleNamespace(headless=True), now=1e9, last_idle_ui_update=0,
+                         idle_ui_interval=10., lock_visible_viewport_to_overview=Mock(),
+                         simulation_app=Mock(), time=SimpleNamespace(sleep=Mock()))
+        code = compile(ast.Module(body=[branch], type_ignores=[]), '<idle-render>', 'exec')
+        exec(code, namespace)
+        namespace['simulation_app'].update.assert_not_called()
+        namespace['time'].sleep.assert_called_once()
+        namespace['args'].headless = False
+        exec(code, namespace)
+        namespace['simulation_app'].update.assert_called_once()
+
     def execute_ticks(self, fail=False):
         source = (BASE / 'run_simulation.py').read_text()
         start = source.index('            physics_start = time.perf_counter()')

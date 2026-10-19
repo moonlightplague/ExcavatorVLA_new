@@ -6,4 +6,5 @@ outputs
 recent*
 models*
 .venv-smolvla/
+.venv-pi05/
 *__pycache__

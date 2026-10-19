@@ -49,7 +49,7 @@ class EpisodeVideo:
                   f'Step {steps}/{self.max_steps}  |  Policy time {steps / self.fps:.1f}s',
                   font=self.font, fill='white')
         draw.text((12, 802), f'Deposited {count}/{self.min_particles} particles  |  '
-                  f'Stable {self.stable_steps}/3  |  Bucket {bucket}', font=self.font, fill='white')
+                  f'Completion observations {self.stable_steps}/3  |  Bucket {bucket}', font=self.font, fill='white')
         if not final:
             result, color = 'RUNNING', (100, 190, 255)
         elif status.get('error') or status.get('status') == 'error':

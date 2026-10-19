@@ -22,6 +22,9 @@ from excavator_common.evaluation_metrics import (
     EpisodeMetrics, METRIC_FIELDS, ParticleTransferTracker, failure_mode, numeric_summary,
 )
 from excavator_common import vla_observation_contract
+from excavator_common.evaluation_standard import (
+    EVALUATION_STANDARD, TRUCK_COUNT_METHOD, CompletionTracker, BUCKET_OPEN_RAD,
+)
 from success_eval_runtime import atomic_json, episode_indices
 from summarize_isaacsim_success_rate import build_summary, load_episode_rows, write_outputs
 
@@ -181,9 +184,10 @@ class SimulatorParticleIndicesTests(unittest.TestCase):
             Usd=SimpleNamespace(TimeCode=SimpleNamespace(Default=lambda: None)),
             Gf=SimpleNamespace(Vec3d=lambda *values: values),
             bucket_source_tracker={'available': True, 'mask': np.array([True, False, True, True, False])},
+            random_scene_profile={'seed': 2}, TRUCK_COUNT_METHOD=TRUCK_COUNT_METHOD,
             bucket_volume_topology={'available': True, 'source': 'mesh', 'reason': 'ok',
                                     'local_min': [0, 0, 0], 'local_max': [1, 1, 1]},
-            truck_bed_counting_volume=dict(available=True, source='bed', reason='ok',
+            truck_bed_counting_volume=dict(available=True, source='bed', reason='ok', scene_seed=2,
                 local_from_world=Identity(), world_min=[0, 0, 0], world_max=[6, 6, 6],
                 local_min=[0, 0, 0], local_max=[6, 6, 6], horizontal_margin=0, lower_margin=0, upper_extra=0),
             points_in_closed_bucket_mesh=lambda values: np.all((values >= 0) & (values <= 1), axis=1),
@@ -199,6 +203,16 @@ class SimulatorParticleIndicesTests(unittest.TestCase):
         self.assertEqual(truck, [2, 3])
         self.assertEqual(truck_metric['count'], 2)
         self.assertEqual(truck_metric['bucket_overlap_count'], 1)
+        namespace['truck_bed_counting_volume']['local_max'] = [5.5, 5.5, 5.5]
+        truck = []
+        self.assertEqual(namespace['estimate_truck_bed_load_particles'](truck)['count'], 1)
+        self.assertEqual(truck, [2])
+        namespace['truck_bed_counting_volume']['local_max'] = [6, 6, 6]
+        namespace['random_scene_profile']['seed'] = 3
+        invalid = namespace['estimate_truck_bed_load_particles']()
+        self.assertFalse(invalid['available'])
+        self.assertIn('different scene', invalid['reason'])
+        namespace['random_scene_profile']['seed'] = 2
         # The policy's observation fallback may count non-source material. The
         # evaluation must still track only IDs in the strict initial-pile mask.
         points = np.array([[.2, .2, .2]] * 40 + [[5, 5, 5], [6, 6, 6]])
@@ -213,7 +227,7 @@ class SimulatorParticleIndicesTests(unittest.TestCase):
 
 
 class RolloutIntegrationTests(unittest.TestCase):
-    def run_rollout(self, directory, *, video=True, steps=8, replay=False, fail=False, video_error=False, episodes=1):
+    def run_rollout(self, directory, *, video=True, steps=8, replay=False, fail=False, video_error=False, episodes=1, interrupt=False):
         clock = SimpleNamespace(now=0.)
         clock.monotonic = clock.perf_counter = lambda: clock.now
 
@@ -252,6 +266,8 @@ class RolloutIntegrationTests(unittest.TestCase):
             if command.get('type') == 'handshake':
                 return {'type': 'handshake_ack', 'timing_mode': 'deterministic_lockstep',
                         'state_names': list(range(28)), 'training_fps': 10}
+            if interrupt:
+                raise KeyboardInterrupt('evaluation interrupted')
             if fail:
                 raise RuntimeError('bridge broke')
             advance(.25)
@@ -275,22 +291,26 @@ class RolloutIntegrationTests(unittest.TestCase):
         namespace = dict(
             np=np, json=json, time=clock, torch=SimpleNamespace(manual_seed=lambda seed: None, inference_mode=nullcontext),
             EpisodeVideo=Video, EpisodeMetrics=EpisodeMetrics, failure_mode=failure_mode,
+            CompletionTracker=CompletionTracker, BUCKET_OPEN_RAD=BUCKET_OPEN_RAD,
             episode_indices=episode_indices, atomic_json=atomic_json, exchange=exchange,
             STATE_NAMES_28D=tuple(range(28)), OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT='v4',
             build_client_contract=lambda *args: {'type': 'handshake'},
             validate_state=lambda result: np.zeros(28), observation=lambda result: {},
             deposited_count=lambda result: result['truck_bed_load_metrics']['count'],
+            validate_scene_metric=lambda *args: None, image_hashes=lambda result: {}, random=Mock(),
         )
-        extract_functions(BASE / 'scripts/eval_smolvla_success.py', {'update_success', 'run_episodes'}, namespace)
+        extract_functions(BASE / 'scripts/eval_smolvla_success.py', {'run_episodes'}, namespace)
         args = SimpleNamespace(episodes=episodes, worker_index=0, worker_count=1, output=Path(directory),
                                gpu_label='test', seed=2, video=video, steps=steps, min_particles=2,
                                replay_reference=replay, replan_interval=3, fresh_simulator=False)
         reference = {'actions': [np.zeros(4)] * 2, 'expected_initial_state': np.zeros(28)} if replay else None
-        config = {'execution_source': 'expert_replay' if replay else 'model'}
+        config = {'execution_source': 'expert_replay' if replay else 'model',
+                  'evaluation_standard': EVALUATION_STANDARD, 'evaluation_profile': 'diagnostic',
+                  'evaluation_id': 'fixture', 'checkpoint_sha256': 'fixture-checkpoint'}
         call = lambda: namespace['run_episodes'](args, {'fps': 10}, reference, np.ones(4),
                     None if replay else policy, lambda value: value, lambda value: value, '', config, session)
-        if fail or video_error:
-            with self.assertRaises(SystemExit):
+        if fail or video_error or interrupt:
+            with self.assertRaises(KeyboardInterrupt if interrupt else SystemExit):
                 call()
         else:
             call()
@@ -301,13 +321,13 @@ class RolloutIntegrationTests(unittest.TestCase):
             rows, policy = self.run_rollout(directory, episodes=2)
             for row in rows:
                 self.assertTrue(row['success'])
-                self.assertEqual(row['policy_steps_executed'], 5)
+                self.assertEqual(row['policy_steps_executed'], 4)
                 self.assertEqual(row['payload_particles'], 2)
                 self.assertEqual(row['spillage_particles'], 1)
                 self.assertEqual(row['spillage_fraction'], .25)
-                self.assertAlmostEqual(row['cycle_time_seconds'], .5)
-                self.assertAlmostEqual(row['cycle_time_wall_seconds'], 4.05)
-                self.assertAlmostEqual(row['fps'], 5 / 4.55)
+                self.assertAlmostEqual(row['cycle_time_seconds'], .4)
+                self.assertAlmostEqual(row['cycle_time_wall_seconds'], 3.3)
+                self.assertAlmostEqual(row['fps'], 4 / 3.8)
                 self.assertAlmostEqual(row['policy_latency_ms_mean'], 400)
                 self.assertEqual(row['policy_inference_calls'], 2)
                 self.assertEqual(row['failure_mode'], 'none')
@@ -330,7 +350,7 @@ class RolloutIntegrationTests(unittest.TestCase):
                 rows, _ = self.run_rollout(directory, video=False, steps=2 if not replay else 8, replay=replay)
                 row = rows[0]
                 self.assertFalse(row['success'])
-                self.assertEqual(row['failure_mode'], 'unstable_deposit')
+                self.assertEqual(row['failure_mode'], 'completion_not_sustained')
                 self.assertIsNone(row['cycle_time_seconds'])
                 self.assertAlmostEqual(row['simulated_rollout_time_seconds'], .2)
                 if replay:
@@ -342,8 +362,16 @@ class RolloutIntegrationTests(unittest.TestCase):
             with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
                 rows, _ = self.run_rollout(directory, fail=fail, video_error=video_error)
                 self.assertEqual(rows[0]['status'], 'error')
+                self.assertFalse(rows[0]['success'])
                 self.assertEqual(rows[0]['failure_mode'], 'infrastructure_error')
                 self.assertIsNone(rows[0]['cycle_time_seconds'])
+
+    def test_interruption_persists_an_error_and_never_a_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows, _ = self.run_rollout(directory, interrupt=True, video=False)
+            self.assertEqual(rows[0]['status'], 'error')
+            self.assertFalse(rows[0]['success'])
+            self.assertIn('KeyboardInterrupt', rows[0]['error'])
 
 
 class HistoricalAndValidationTests(unittest.TestCase):
