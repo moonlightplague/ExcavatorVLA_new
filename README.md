@@ -2,6 +2,9 @@
 
 See [the training/deployment diagnosis](docs/training_diagnosis.md) for the
 verified causes of the failed SmolVLA evaluations, fixes, checkpoints and videos.
+The [2026-10-20 evaluation regression fix](docs/smolvla_evaluation_regression_20261020.md)
+documents the retained-payload stall, corrected sand/target initialization,
+and fresh simulator lifecycle.
 
 ACT training, fixed episode splits and benchmark evaluation are implemented in
 the [ExcavatorVLA-vlm submodule](ExcavatorVLA-vlm/README.md).

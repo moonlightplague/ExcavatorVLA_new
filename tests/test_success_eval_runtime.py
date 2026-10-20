@@ -60,6 +60,29 @@ class GpuAssignmentTests(unittest.TestCase):
 
 
 class SimulatorLifecycleTests(unittest.TestCase):
+    def test_default_starts_a_fresh_process_and_socket_for_every_episode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_process, second_process = Mock(pid=123), Mock(pid=456)
+            first_sock, second_sock = Mock(), Mock()
+            exchange = Mock()
+            session = runtime.SimulatorSession(['isaac'], Path(directory),
+                                               Path(directory) / 'simulator.log', False, exchange)
+            with patch.object(runtime.subprocess, 'Popen', side_effect=[first_process, second_process]) as launch, \
+                    patch.object(runtime, 'connect_simulator', side_effect=[first_sock, second_sock]), \
+                    patch.object(runtime, 'stop_simulator') as stop:
+                first = session.prepare(2)
+                second = session.prepare(9)
+                self.assertFalse(first['simulator_reused'])
+                self.assertFalse(second['simulator_reused'])
+                self.assertNotEqual(first['simulator_pid'], second['simulator_pid'])
+                self.assertIs(session.sock, second_sock)
+                self.assertEqual(launch.call_count, 2)
+                stop.assert_called_once_with(first_process)
+                first_sock.close.assert_called_once()
+                exchange.assert_not_called()
+                session.close()
+                self.assertEqual(stop.call_count, 2)
+
     def test_second_episode_resets_same_process_and_socket(self):
         with tempfile.TemporaryDirectory() as directory:
             process = Mock(pid=123)
@@ -67,7 +90,8 @@ class SimulatorLifecycleTests(unittest.TestCase):
             sock = Mock()
             exchange = Mock(return_value={'type': 'reset_episode_ack', 'scene_seed': 9})
             session = runtime.SimulatorSession(['isaac', 'simulation.py'], Path(directory),
-                                               Path(directory) / 'simulator.log', False, exchange)
+                                               Path(directory) / 'simulator.log', False, exchange,
+                                               reuse_process=True)
             with patch.object(runtime.subprocess, 'Popen', return_value=process) as launch, \
                     patch.object(runtime, 'connect_simulator', return_value=sock), \
                     patch.object(runtime, 'stop_simulator') as stop:
@@ -103,7 +127,8 @@ class SimulatorLifecycleTests(unittest.TestCase):
 
     def test_wrong_reset_seed_is_rejected(self):
         session = runtime.SimulatorSession([], Path('.'), Path('unused'), False,
-                                           Mock(return_value={'type': 'reset_episode_ack', 'scene_seed': 7}))
+                                           Mock(return_value={'type': 'reset_episode_ack', 'scene_seed': 7}),
+                                           reuse_process=True)
         session.process, session.sock = Mock(pid=1), Mock()
         with self.assertRaisesRegex(ValueError, 'reset acknowledgment'):
             session.prepare(8)

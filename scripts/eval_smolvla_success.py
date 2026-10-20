@@ -27,6 +27,7 @@ from excavator_common.deployment_contract import (
     ACTION_NAMES_4D, sha256_files,
 )
 from excavator_common.evaluation_metrics import EpisodeMetrics, METRIC_DEFINITIONS, failure_mode
+from excavator_common.collection_target import TARGET_METHOD, SAND_INITIALIZATION_METHOD
 from excavator_common.evaluation_standard import (
     EVALUATION_STANDARD, TRUCK_COUNT_METHOD, BUCKET_OPEN_RAD, COMPLETION_OBSERVATIONS,
     CompletionTracker, execution_profile,
@@ -171,6 +172,8 @@ def main():
     config.update(evaluation_standard=EVALUATION_STANDARD, truck_count_method=TRUCK_COUNT_METHOD,
                   evaluation_profile=execution_profile(args.fresh_simulator, args.render_every_physics_step,
                                                        args.headless, reference is not None))
+    config.update(sand_initialization=SAND_INITIALIZATION_METHOD,
+                  dig_target_method='cli_recorded_dig_target' if reference else TARGET_METHOD)
     config['metric_definitions'] = METRIC_DEFINITIONS
     if args.worker_index is None:
         args.output.mkdir(parents=True, exist_ok=False)
@@ -178,7 +181,8 @@ def main():
             'evaluation_standard', 'evaluation_profile', 'policy_type', 'truck_count_method',
             'episodes', 'steps', 'min_particles', 'seed', 'replan_interval', 'training_fps',
             'initial_joints_deg', 'bucket_open_threshold', 'completion_observations',
-            'fresh_simulator', 'render_every_physics_step', 'headless', 'execution_source')}
+            'fresh_simulator', 'render_every_physics_step', 'headless', 'execution_source',
+            'sand_initialization', 'dig_target_method')}
         software = {'python': sys.version, 'torch': torch.__version__, 'cuda': torch.version.cuda}
         for package in ('lerobot', 'transformers', 'numpy', 'pillow'):
             software[package] = importlib.metadata.version(package)
@@ -265,7 +269,8 @@ def main():
                     '--state27-unload-target-world', *map(str, reference['profile']['unload_landing_xyz']),
                     '--task-text', reference['task']]
     session = SimulatorSession(command, REPO, worker_dir / 'simulator.log',
-                               args.video, exchange, args.startup_timeout)
+                               args.video, exchange, args.startup_timeout,
+                               reuse_process=not args.fresh_simulator)
     try:
         run_episodes(args, info, reference, action_limits, policy,
                      preprocess if policy is not None else None,

@@ -42,7 +42,7 @@ def main():
                '--cpu-threads', '14', '--idle-ui-hz', '0.1', '--sand-amount', '1',
                '--robot-initial-joints-deg', *map(str, pose)]
     session = SimulatorSession(command, BASE / 'ExcavatorVLA-smolvla',
-                               args.output / 'simulator.log', False, exchange)
+                               args.output / 'simulator.log', False, exchange, reuse_process=True)
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     results = []
     try:

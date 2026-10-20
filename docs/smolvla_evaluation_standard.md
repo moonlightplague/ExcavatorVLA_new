@@ -33,6 +33,21 @@ can take many hours. `runtime.json` records total elapsed time, including startu
   collision, target, or renderer history is reused in a standard run.
   Randomized scenes use the fixed `--sand-amount 1` setting; the sampler's nominal
   amount in `scene_profile` does not override that explicit choice.
+- Temporary rectangular generation walls stay in place during sand settling
+  and are removed before rollout, as in collection. Disabling the optional
+  circular wall does not remove the generation walls early. The simulator
+  session itself also defaults to a fresh process; persistent reuse requires
+  explicit opt-in through the diagnostic `--no-fresh-simulator` path.
+- Randomized digging targets use `collection_local_cut_surface_depth_v1`:
+  query the local particle surface with collection's small 90th-percentile
+  probes, take the low surface along the inward cut path, and subtract the
+  deepest configured cut (0.58 m), extra bite (0.12 m), and surface uncertainty.
+  The target remains at least 0.04 m above the sand floor. A percentile of
+  the pile's particle heights is not used as the digging target. Reference
+  episode replay retains the exact recorded target.
+  `config.json` and the provenance protocol record both the target method and
+  sand initialization method. Each scene records the surface probes and
+  resulting depth in `scene_context.json`.
 - Physics runs at 60 Hz; commands advance exactly the dataset action interval
   (10 Hz for the current dataset). Command velocities integrate into a persistent
   position target. There is no handwritten action supervisor or task recovery.
@@ -70,6 +85,12 @@ useful for investigating the simulator but cannot produce an official rate.
 The persistent reset path remains supported and now rebuilds truck counting
 bounds and inverse transforms after every truck relocation. Fresh and reset
 scenes are not asserted to have identical sand/solver/renderer states.
+
+The 2026-10-20 initialization/target correction changes the environment seen
+by the policy; rerun earlier scores before comparing them with corrected runs.
+The completion/scoring rule remains v2. See the
+[regression investigation](smolvla_evaluation_regression_20261020.md) for the
+controlled seed-26 tests and live verification.
 
 ## Payload and completion
 

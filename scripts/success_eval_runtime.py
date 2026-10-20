@@ -153,18 +153,22 @@ def connect_simulator(process, port, timeout=600):
 
 
 class SimulatorSession:
-    """Own one persistent simulator and socket; always reap it on exit."""
-    def __init__(self, command, cwd, log_path, video, exchange, startup_timeout=600):
+    """Start a fresh simulator per episode; reuse requires explicit opt-in."""
+    def __init__(self, command, cwd, log_path, video, exchange, startup_timeout=600,
+                 reuse_process=False):
         self.command = command
         self.cwd = cwd
         self.log_path = Path(log_path)
         self.video = video
         self.exchange = exchange
         self.startup_timeout = startup_timeout
+        self.reuse_process = reuse_process
         self.process = self.sock = self.log = None
 
     def prepare(self, seed):
         started = time.monotonic()
+        if self.process is not None and not self.reuse_process:
+            self.close()
         reused = self.process is not None
         if reused:
             ack = self.exchange(self.sock, {'type': 'reset_episode', 'scene_seed': seed})

@@ -58,14 +58,16 @@ class SceneResetTests(unittest.TestCase):
                                     relocate_sand_source=Mock(), sand_particle_points=Mock(
                                         return_value=([1, 2], [0, 0], [.1, .1], {})))
         self.namespace = dict(
-            np=np, sand_enabled=True, args=SimpleNamespace(sand_wall=False, scene_seed=2, sand_settle_frames=3),
+            np=np, sand_enabled=True, args=SimpleNamespace(sand_wall=False, scene_seed=2,
+                                                          sand_settle_frames=3, retaining_walls=True),
             timeline=Mock(), robot=Mock(), simulation_app=Mock(), world=Mock(),
             episode_initial_pose=self.initial, restore_excavator_pose_after_sand_init=Mock(),
             set_prim_translation_and_yaw=Mock(), stage=Mock(), TRUCK_ROOT_PATH='/World/truck',
             authored_truck_translation=[0, 0, 0], authored_truck_yaw=0,
             apply_randomized_dataset_scene=lambda: {'sand_xy': [5, 6]},
             elevate_excavator_for_sand_init=lambda *args: self.lifted,
-            sand_module=self.sand, sand_api={}, builtins=SimpleNamespace(), sand_root_path='/World/SandSite',
+            sand_module=self.sand, sand_api={'create_sand_retaining_walls': Mock()},
+            remove_sand_settling_walls=Mock(), builtins=SimpleNamespace(), sand_root_path='/World/SandSite',
             UsdGeom=SimpleNamespace(Points=lambda prim: self.particles),
             resolve_state27_dig_target=lambda: ([5, 6, 1], 'new-dig'),
             resolve_state27_unload_target=lambda: ([2, 3, 4], 'new-unload'),
@@ -83,6 +85,8 @@ class SceneResetTests(unittest.TestCase):
         self.particles.GetPointsAttr().Set.assert_called_once_with([1, 2])
         self.particles.GetVelocitiesAttr().Set.assert_called_once_with([0, 0])
         self.assertEqual(self.namespace['world'].step.call_count, 3)
+        self.namespace['sand_api']['create_sand_retaining_walls'].assert_called_once()
+        self.namespace['remove_sand_settling_walls'].assert_called_once()
         self.assertEqual(self.namespace['state27_dig_target_world'], [5, 6, 1])
         self.assertEqual(self.namespace['truck_bed_counting_volume']['scene_seed'], 9)
         self.namespace['authored_truck_bed_counting_volume'].assert_called_once()
@@ -105,6 +109,12 @@ class SceneResetTests(unittest.TestCase):
     def test_settling_error_restores_robot_before_propagating_failure(self):
         self.namespace['world'].step.side_effect = RuntimeError('physics failed')
         with self.assertRaisesRegex(RuntimeError, 'physics failed'):
+            self.reset(9)
+        self.namespace['restore_excavator_pose_after_sand_init'].assert_called_with(self.initial)
+
+    def test_wall_cleanup_error_still_restores_robot(self):
+        self.namespace['remove_sand_settling_walls'].side_effect = RuntimeError('wall cleanup failed')
+        with self.assertRaisesRegex(RuntimeError, 'wall cleanup failed'):
             self.reset(9)
         self.namespace['restore_excavator_pose_after_sand_init'].assert_called_with(self.initial)
 
@@ -134,6 +144,59 @@ class SceneResetTests(unittest.TestCase):
                 self.assertEqual(namespace['deployment_elapsed_seconds'], 0)
                 reply = namespace['response_queue'].put.call_args.args[0]
                 self.assertEqual(reply['type'], 'error' if fail else 'reset_episode_ack')
+
+
+class SandInitializationTests(unittest.TestCase):
+    def test_disabling_circular_wall_preserves_rectangular_generation_walls(self):
+        source = (BASE / 'run_simulation.py').read_text()
+        start = source.index('    circular_wall_path = (')
+        end = source.index('    def remove_sand_settling_walls():', start)
+        present = {'/World/SandSite/SandRetainingWalls'}
+        cleanup = Mock(side_effect=lambda: present.clear())
+        namespace = dict(sand_root_path='/World/SandSite', sand_enabled=True,
+                         args=SimpleNamespace(sand_wall=False),
+                         sand_api={'clean_sand_retaining_walls': cleanup},
+                         stage=SimpleNamespace(GetPrimAtPath=lambda path:
+                             SimpleNamespace(IsValid=lambda: path in present)))
+        exec(compile(textwrap.dedent(source[start:end]), '<wall-selection>', 'exec'), namespace)
+        cleanup.assert_not_called()
+        self.assertIn('/World/SandSite/SandRetainingWalls', present)
+
+    def test_fresh_scene_removes_walls_after_physics_settling_before_robot_restore(self):
+        source = (BASE / 'run_simulation.py').read_text()
+        events = []
+        present = {'/World/SandSite/SandRetainingWalls'}
+
+        def cleanup():
+            events.append('remove_walls')
+            present.clear()
+
+        api = {'clean_sand_retaining_walls': cleanup,
+               'get_status': lambda: {'real_sand_enabled': True, 'real_sand_particle_count': 100}}
+        namespace = dict(sand_enabled=True, args=SimpleNamespace(sand_settle_frames=3),
+                         world=SimpleNamespace(step=lambda **kwargs: events.append('physics')),
+                         simulation_app=Mock(), sand_api=api, builtins=SimpleNamespace(_SAND_SITE=api),
+                         sand_wall_path='/World/SandSite/SandRetainingWalls',
+                         stage=SimpleNamespace(GetPrimAtPath=lambda path:
+                             SimpleNamespace(IsValid=lambda: path in present)),
+                         restore_excavator_pose_after_sand_init=lambda snapshot: events.append('restore_robot'),
+                         excavator_pose_snapshot={})
+        extract(BASE / 'run_simulation.py', 'remove_sand_settling_walls', namespace)
+        start = source.index('    if not sand_enabled:\n        print(')
+        end = source.index('    timeline.pause()\n    if recorded_raw_initial_q', start)
+        exec(compile(textwrap.dedent(source[start:end]), '<fresh-sand-settling>', 'exec'), namespace)
+        self.assertEqual(events, ['physics', 'physics', 'physics', 'remove_walls', 'restore_robot'])
+
+    def test_wall_cleanup_rejects_missing_api_or_remaining_collision_walls(self):
+        namespace = dict(sand_api={}, sand_wall_path='/walls',
+                         stage=SimpleNamespace(GetPrimAtPath=lambda path:
+                             SimpleNamespace(IsValid=lambda: True)))
+        cleanup = extract(BASE / 'run_simulation.py', 'remove_sand_settling_walls', namespace)
+        with self.assertRaisesRegex(RuntimeError, 'cannot remove'):
+            cleanup()
+        namespace['sand_api']['clean_sand_retaining_walls'] = Mock()
+        with self.assertRaisesRegex(RuntimeError, 'remained'):
+            cleanup()
 
 
 class LockstepPhysicsTests(unittest.TestCase):
