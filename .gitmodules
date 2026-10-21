@@ -10,3 +10,7 @@
 	path = ExcavatorVLA-smolvla
 	url = https://github.com/moonlightplague/ExcavatorVLA.git
 	branch = smolvla
+[submodule "baseline"]
+	path = baseline
+	url = https://github.com/moonlightplague/ExcavatorVLA.git
+	branch = repeated_process

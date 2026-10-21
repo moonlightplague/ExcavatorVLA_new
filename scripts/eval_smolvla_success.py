@@ -98,7 +98,7 @@ def observation(reply):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
-    parser.add_argument('--policy-type', choices=['smolvla', 'act', 'pi05', 'diffusion'], default='smolvla')
+    parser.add_argument('--policy-type', choices=['smolvla', 'act', 'pi05', 'diffusion', 'vqbet'], default='smolvla')
     parser.add_argument('--dataset', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--episodes', type=int, default=1)
@@ -233,17 +233,28 @@ def main():
         if policy_config.type != args.policy_type:
             raise ValueError('Checkpoint policy type differs from --policy-type')
         policy_config.device = 'cuda'
-        if args.policy_type in ('act', 'diffusion'):
+        if args.policy_type in ('act', 'diffusion', 'vqbet'):
             policy_config.pretrained_backbone_weights = None
             if args.policy_type == 'act' and policy_config.temporal_ensemble_coeff is not None:
                 raise ValueError('Shared evaluator executes chunks; ACT temporal ensembling must be disabled')
-        chunk_len = policy_config.chunk_size if hasattr(policy_config, 'chunk_size') else policy_config.horizon
+        if hasattr(policy_config, 'chunk_size'):
+            chunk_len = policy_config.chunk_size
+        elif hasattr(policy_config, 'horizon'):
+            chunk_len = policy_config.horizon
+        else:
+            chunk_len = policy_config.action_chunk_size  # vqbet
         if args.replan_interval > chunk_len:
             raise ValueError('Replan interval cannot exceed checkpoint chunk size')
         if args.policy_type == 'diffusion':
             sys.path.insert(0, str(BASE / 'ExcavatorVLA-vlm'))
             from excavator_vlm.policies.diffusion.adapter import ExcavatorDiffusionPolicy
             policy = ExcavatorDiffusionPolicy.from_pretrained(
+                str(args.checkpoint), config=policy_config,
+                strict=True, local_files_only=True).to('cuda').eval()
+        elif args.policy_type == 'vqbet':
+            sys.path.insert(0, str(BASE / 'ExcavatorVLA-vlm'))
+            from excavator_vlm.policies.vqbet.adapter import ExcavatorVQBeTPolicy
+            policy = ExcavatorVQBeTPolicy.from_pretrained(
                 str(args.checkpoint), config=policy_config,
                 strict=True, local_files_only=True).to('cuda').eval()
         elif args.policy_type != 'pi05':
