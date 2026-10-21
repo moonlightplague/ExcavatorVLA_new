@@ -98,7 +98,7 @@ def observation(reply):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
-    parser.add_argument('--policy-type', choices=['smolvla', 'act', 'pi05'], default='smolvla')
+    parser.add_argument('--policy-type', choices=['smolvla', 'act', 'pi05', 'diffusion'], default='smolvla')
     parser.add_argument('--dataset', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--episodes', type=int, default=1)
@@ -233,13 +233,20 @@ def main():
         if policy_config.type != args.policy_type:
             raise ValueError('Checkpoint policy type differs from --policy-type')
         policy_config.device = 'cuda'
-        if args.policy_type == 'act':
+        if args.policy_type in ('act', 'diffusion'):
             policy_config.pretrained_backbone_weights = None
-            if policy_config.temporal_ensemble_coeff is not None:
+            if args.policy_type == 'act' and policy_config.temporal_ensemble_coeff is not None:
                 raise ValueError('Shared evaluator executes chunks; ACT temporal ensembling must be disabled')
-        if args.replan_interval > policy_config.chunk_size:
+        chunk_len = policy_config.chunk_size if hasattr(policy_config, 'chunk_size') else policy_config.horizon
+        if args.replan_interval > chunk_len:
             raise ValueError('Replan interval cannot exceed checkpoint chunk size')
-        if args.policy_type != 'pi05':
+        if args.policy_type == 'diffusion':
+            sys.path.insert(0, str(BASE / 'ExcavatorVLA-vlm'))
+            from excavator_vlm.policies.diffusion.adapter import ExcavatorDiffusionPolicy
+            policy = ExcavatorDiffusionPolicy.from_pretrained(
+                str(args.checkpoint), config=policy_config,
+                strict=True, local_files_only=True).to('cuda').eval()
+        elif args.policy_type != 'pi05':
             policy = get_policy_class(args.policy_type).from_pretrained(
                 str(args.checkpoint), config=policy_config,
                 strict=True, local_files_only=True).to('cuda').eval()
