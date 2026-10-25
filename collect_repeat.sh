@@ -11,7 +11,7 @@ POLICY_PYTHON="${POLICY_PYTHON:-$(command -v python)}"
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     echo 'Usage: ./collect_repeat.sh <successful_episodes> [workers=1] [gpu_ids=0] [scoops=3] [baseline/Isaac options...]'
     echo 'Example: ./collect_repeat.sh 10 2 0,1 3'
-    echo 'Default output: data/repeat/{raw,export}; override DATA_ROOT and POLICY_PYTHON as needed.'
+    echo 'Default output: data/repeat/{raw,export_repeat}; override DATA_ROOT, EXPORT_DIR and POLICY_PYTHON as needed.'
     echo 'See baseline/README.md; baseline/collect_repeat.py --help lists baseline options.'
     return
 fi
@@ -52,6 +52,7 @@ fi
 # Resolve before changing directory; callers may supply a relative DATA_ROOT.
 mkdir -p "$DATA_ROOT"
 DATA_ROOT="$(cd "$DATA_ROOT" && pwd)"
+EXPORT_DIR="$("$POLICY_PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "${EXPORT_DIR:-$DATA_ROOT/export_repeat}")"
 BATCH_ID="repeat_$(date +%Y%m%d_%H%M%S)_$$"
 LOG_ROOT="$DATA_ROOT/raw/.collection_logs/$BATCH_ID"
 mkdir -p "$LOG_ROOT"
@@ -168,7 +169,7 @@ PYCODE
             "$POLICY_PYTHON" excavator_dataset_tools.py "$RUN" \
                 --export-lerobot-v3 --export-append \
                 --export-offset "$EPISODE" --export-limit 1 \
-                --export-dir "$DATA_ROOT/export" \
+                --export-dir "$EXPORT_DIR" \
                 --export-state-schema current-v4 --export-effort-policy exclude \
                 --export-require-standard --export-require-vla \
                 2>&1 | tee "$RUN/export_episode_${EPISODE}.log"
@@ -176,7 +177,7 @@ PYCODE
         GAINED=$((GAINED + SUCCESSES))
     done
     REMAINING=$((REMAINING - GAINED))
-    echo "Exported $((COUNT - REMAINING))/$COUNT successful episodes to $DATA_ROOT/export"
+    echo "Exported $((COUNT - REMAINING))/$COUNT successful episodes to $EXPORT_DIR"
     if (( FAILED != 0 || GAINED == 0 )); then
         echo "Collection stopped after worker failure or no progress; raw data and logs remain in $DATA_ROOT/raw." >&2
         exit 1
