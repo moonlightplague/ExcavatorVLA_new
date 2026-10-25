@@ -49,6 +49,12 @@ inside `nest_asyncio.apply()` / `_asyncio._get_running_loop()`). Isaac still use
 its bundled Python; `POLICY_PYTHON` uses the active `ExcavatorVLA` environment.
 
 ## Data collection
+
+For repeated digging, unloading across low areas of the truck bed, and recorded
+physical arm returns, run `./collect_repeat.sh 50 2 0,1 3`. Each episode contains
+three complete cycles in one scene. Output defaults to `data/repeat/{raw,export}`.
+See [baseline/README.md](baseline/README.md) for options, validation, and SmolVLA training.
+
 At least 8GB of VRAM is required for an atomic simulation process.
 
 On a minimal Ubuntu container, install the graphics runtime dependencies first:
