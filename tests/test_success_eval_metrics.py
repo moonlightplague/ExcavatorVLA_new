@@ -4,6 +4,7 @@ from contextlib import nullcontext
 import copy
 import csv
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -26,6 +27,8 @@ from excavator_common.evaluation_standard import (
     EVALUATION_STANDARD, TRUCK_COUNT_METHOD, CompletionTracker, BUCKET_OPEN_RAD,
 )
 from success_eval_runtime import atomic_json, episode_indices
+from success_eval_diagnostics import RolloutDiagnostics
+from excavator_common.simulation_settings import resolve_simulation_settings
 from summarize_isaacsim_success_rate import build_summary, load_episode_rows, write_outputs
 
 
@@ -228,6 +231,7 @@ class SimulatorParticleIndicesTests(unittest.TestCase):
 
 class RolloutIntegrationTests(unittest.TestCase):
     def run_rollout(self, directory, *, video=True, steps=8, replay=False, fail=False, video_error=False, episodes=1, interrupt=False):
+        simulation_settings = resolve_simulation_settings(environ={})
         clock = SimpleNamespace(now=0.)
         clock.monotonic = clock.perf_counter = lambda: clock.now
 
@@ -248,6 +252,7 @@ class RolloutIntegrationTests(unittest.TestCase):
 
         policy.predict_action_chunk.side_effect = infer
         session = Mock(log_path=Path(directory) / 'simulator.log')
+        (Path(directory) / 'workers' / 'worker_00').mkdir(parents=True)
         sequences = []
 
         def prepare(seed):
@@ -262,7 +267,8 @@ class RolloutIntegrationTests(unittest.TestCase):
         def exchange(sock, command):
             if command.get('type') == 'scene_context':
                 return {'scene_seed': session.prepare.call_args.args[0], 'simulator_pid': 123,
-                        'observation_context': {}}
+                        'observation_context': {}, 'simulation_settings': simulation_settings,
+                        'canonical_joint_limits_rad': [[-math.pi, math.pi]] * 4}
             if command.get('type') == 'handshake':
                 return {'type': 'handshake_ack', 'timing_mode': 'deterministic_lockstep',
                         'state_names': list(range(28)), 'training_fps': 10}
@@ -289,24 +295,29 @@ class RolloutIntegrationTests(unittest.TestCase):
                     raise RuntimeError('encoder broke')
 
         namespace = dict(
-            np=np, json=json, time=clock, torch=SimpleNamespace(manual_seed=lambda seed: None, inference_mode=nullcontext),
+            np=np, json=json, math=math, time=clock,
+            torch=SimpleNamespace(manual_seed=lambda seed: None, inference_mode=nullcontext),
             EpisodeVideo=Video, EpisodeMetrics=EpisodeMetrics, failure_mode=failure_mode,
+            RolloutDiagnostics=RolloutDiagnostics,
             CompletionTracker=CompletionTracker, BUCKET_OPEN_RAD=BUCKET_OPEN_RAD,
             episode_indices=episode_indices, atomic_json=atomic_json, exchange=exchange,
             STATE_NAMES_28D=tuple(range(28)), OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT='v4',
             build_client_contract=lambda *args: {'type': 'handshake'},
-            validate_state=lambda result: np.zeros(28), observation=lambda result: {},
+            validate_state=lambda result: np.zeros(28), decoded_frames=lambda result: {},
+            frame_hashes=lambda frames: {}, policy_batch=lambda *args: {},
             deposited_count=lambda result: result['truck_bed_load_metrics']['count'],
-            validate_scene_metric=lambda *args: None, image_hashes=lambda result: {}, random=Mock(),
+            validate_scene_metric=lambda *args: None, random=Mock(),
         )
         extract_functions(BASE / 'scripts/eval_smolvla_success.py', {'run_episodes'}, namespace)
         args = SimpleNamespace(episodes=episodes, worker_index=0, worker_count=1, output=Path(directory),
                                gpu_label='test', seed=2, video=video, steps=steps, min_particles=2,
-                               replay_reference=replay, replan_interval=3, fresh_simulator=False)
+                               replay_reference=replay, replan_interval=3, fresh_simulator=False,
+                               save_trajectory=False, progress_interval=15.)
         reference = {'actions': [np.zeros(4)] * 2, 'expected_initial_state': np.zeros(28)} if replay else None
         config = {'execution_source': 'expert_replay' if replay else 'model',
                   'evaluation_standard': EVALUATION_STANDARD, 'evaluation_profile': 'diagnostic',
-                  'evaluation_id': 'fixture', 'checkpoint_sha256': 'fixture-checkpoint'}
+                  'evaluation_id': 'fixture', 'checkpoint_sha256': 'fixture-checkpoint',
+                  'simulation_settings': simulation_settings}
         call = lambda: namespace['run_episodes'](args, {'fps': 10}, reference, np.ones(4),
                     None if replay else policy, lambda value: value, lambda value: value, '', config, session)
         if fail or video_error or interrupt:
@@ -335,6 +346,15 @@ class RolloutIntegrationTests(unittest.TestCase):
             trace = [json.loads(line) for line in (Path(directory) / 'episodes/episode_0001/steps.jsonl').read_text().splitlines()]
             self.assertEqual(sum(row['policy_latency_ms'] is not None for row in trace), 2)
             self.assertAlmostEqual(trace[0]['bridge_latency_ms'], 250)
+            for index in (1, 2):
+                folder = Path(directory) / 'episodes' / f'episode_{index:04d}'
+                status = json.loads((folder / 'episode_status.json').read_text())
+                diagnostics = json.loads((folder / 'diagnostics.json').read_text())
+                self.assertEqual(diagnostics, status['diagnostics'])
+                self.assertEqual(diagnostics['observations'], 4)
+            progress = json.loads((Path(directory) / 'workers/worker_00/progress.json').read_text())
+            self.assertEqual((progress['phase'], progress['episode_index'], progress['steps']),
+                             ('completed', 2, 4))
             write_outputs(Path(directory), rows, build_summary(rows, 2))
             summary = json.loads((Path(directory) / 'success_rate_summary.json').read_text())
             self.assertEqual(summary['metrics']['payload_particles']['mean'], 2)

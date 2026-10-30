@@ -1,10 +1,11 @@
 """Exercise scene/reset transitions with Isaac stand-ins; live runs cover PhysX."""
 import ast
+import os
 from pathlib import Path
 import textwrap
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -75,6 +76,11 @@ class SceneResetTests(unittest.TestCase):
             truck_bed_counting_volume={'available': True, 'scene_seed': 2},
             authored_truck_bed_counting_volume=Mock(return_value={'available': True, 'scene_seed': 9}),
         )
+        self.namespace['os'] = os
+        extract(BASE / 'run_simulation.py', '_sand_walls_during_settle', self.namespace)
+        self.wall_env = patch.dict(os.environ, EXCAVATOR_SAND_WALLS_DURING_SETTLE='1')
+        self.wall_env.start()
+        self.addCleanup(self.wall_env.stop)
         self.reset = extract(BASE / 'run_simulation.py', 'reset_evaluation_scene', self.namespace)
 
     def test_reset_reuses_particle_prim_and_restores_robot_and_new_targets(self):
@@ -153,12 +159,14 @@ class SandInitializationTests(unittest.TestCase):
         end = source.index('    def remove_sand_settling_walls():', start)
         present = {'/World/SandSite/SandRetainingWalls'}
         cleanup = Mock(side_effect=lambda: present.clear())
-        namespace = dict(sand_root_path='/World/SandSite', sand_enabled=True,
+        namespace = dict(os=os, sand_root_path='/World/SandSite', sand_enabled=True,
                          args=SimpleNamespace(sand_wall=False),
                          sand_api={'clean_sand_retaining_walls': cleanup},
                          stage=SimpleNamespace(GetPrimAtPath=lambda path:
                              SimpleNamespace(IsValid=lambda: path in present)))
-        exec(compile(textwrap.dedent(source[start:end]), '<wall-selection>', 'exec'), namespace)
+        extract(BASE / 'run_simulation.py', '_sand_walls_during_settle', namespace)
+        with patch.dict(os.environ, EXCAVATOR_SAND_WALLS_DURING_SETTLE='1'):
+            exec(compile(textwrap.dedent(source[start:end]), '<wall-selection>', 'exec'), namespace)
         cleanup.assert_not_called()
         self.assertIn('/World/SandSite/SandRetainingWalls', present)
 

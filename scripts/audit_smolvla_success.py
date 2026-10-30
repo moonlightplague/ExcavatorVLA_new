@@ -11,6 +11,7 @@ sys.path[:0] = [str(BASE / 'ExcavatorVLA-smolvla'),
 from excavator_common.evaluation_standard import EVALUATION_STANDARD, TRUCK_COUNT_METHOD, CompletionTracker
 from summarize_isaacsim_success_rate import build_summary, load_episode_rows
 from success_eval_runtime import atomic_json, content_id, file_manifest
+from success_eval_diagnostics import RolloutDiagnostics
 
 
 def require(condition, message):
@@ -28,6 +29,9 @@ def audit_episode(folder, status):
     require(scene['truck_counting_volume']['scene_seed'] == seed, 'Stale initial truck geometry')
     require(len(trace) == status['policy_steps_executed'] and trace, 'Executed action count differs from trace')
     require(len(scene['canonical_joint_limits_rad']) == 4, 'Missing canonical joint limits')
+    action_seconds = trace[0]['bridge_timing']['simulated_seconds']
+    diagnostics = RolloutDiagnostics(scene['canonical_joint_limits_rad'],
+                                     stall_window_steps=max(2, math.ceil(5 / action_seconds)))
     completion = CompletionTracker(status['min_particles'])
     duration = 0.
     for index, row in enumerate(trace):
@@ -40,6 +44,7 @@ def audit_episode(folder, status):
         require(0 <= row['deposited_particles'] == transfer['payload_particles'] <= metric['count']
                 <= metric['local_box_count'] <= metric['candidate_count'], 'Inconsistent deposit accounting')
         require(all(math.isfinite(v) for v in row['state']), 'Nonfinite state')
+        diagnostics.observe(index, row['state'], row['joint_command_positions'], transfer)
         for command, (lower, upper) in zip(row['joint_command_positions'], scene['canonical_joint_limits_rad']):
             require(math.isfinite(command) and lower - 1e-5 <= command <= upper + 1e-5,
                     'Integrated command exceeds the articulation limits')
@@ -61,7 +66,8 @@ def audit_episode(folder, status):
     require(math.isclose(duration, status['simulated_rollout_time_seconds'], abs_tol=1e-8),
             'Rollout duration differs from its physics actions')
     require(initial['truck_bed_load_metrics']['scene_seed'] == seed, 'Stale initial count')
-    return dict(seed=seed, steps=len(trace), success=succeeded, simulated_seconds=duration)
+    return dict(seed=seed, steps=len(trace), success=succeeded, simulated_seconds=duration,
+                diagnostics=diagnostics.summary())
 
 
 def audit_batch(folder, verify_sources=False):

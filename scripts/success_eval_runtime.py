@@ -29,10 +29,11 @@ def evaluation_provenance(base, checkpoint, dataset, protocol, software):
     simulator = base / 'ExcavatorVLA-smolvla'
     sources = [*simulator.glob('excavator_common/*.py'), simulator / 'run_simulation.py',
                simulator / 'scripts/excavator_app/sand_site_runtime.py',
+               simulator / 'scripts/excavator_app/newton_mpm_soil.py',
                simulator / 'scripts/evaluation/summarize_isaacsim_success_rate.py',
                *[base / 'scripts' / name for name in (
                    'eval_smolvla_success.py', 'success_eval_runtime.py', 'eval_video.py',
-                   'excavator_diagnostics.py')],
+                   'excavator_diagnostics.py', 'success_eval_diagnostics.py')],
                base / 'ExcavatorVLA-isaac/assets/usd/excavator_scene.usd', base / 'run_isaac_python.sh']
     checkpoint_files = file_manifest([p for p in checkpoint.rglob('*') if p.is_file()], checkpoint)
     source_files = file_manifest(sources, base)
@@ -227,6 +228,8 @@ def run_workers(args, entrypoint, gpu_ids, summarize):
     processes = []
     logs = []
     reported = set()
+    progress_interval = getattr(args, 'progress_interval', 15.)
+    progress_reported = {}
     failed = False
     try:
         for index, gpu in enumerate(gpu_ids[:worker_count]):
@@ -255,6 +258,30 @@ def run_workers(args, entrypoint, gpu_ids, summarize):
                           f"policy_latency_ms={row.get('policy_latency_ms_mean')}, fps={row.get('fps')}, "
                           f"error={row['error']}", flush=True)
                     reported.add(index)
+            if progress_interval > 0:
+                now = time.monotonic()
+                for index in range(worker_count):
+                    path = args.output / 'workers' / f'worker_{index:02d}' / 'progress.json'
+                    try:
+                        progress = json.loads(path.read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        continue
+                    phase = progress['phase']
+                    previous_phase, last_report = progress_reported.get(index, (None, -float('inf')))
+                    if phase in ('completed', 'error') or (
+                            phase == previous_phase and now - last_report < progress_interval):
+                        continue
+                    episode = progress.get('episode_index')
+                    prefix = f'Worker {index}' + (f', episode {episode}/{args.episodes}' if episode else '')
+                    message = f'{prefix}: {phase}'
+                    if phase == 'rollout':
+                        message += (f", step={progress['steps']}/{progress['max_steps']}, "
+                                    f"payload={progress['payload_particles']}, "
+                                    f"retained={progress['retained_particles']}")
+                    if progress.get('warnings'):
+                        message += ', warnings=' + ','.join(progress['warnings'])
+                    print(message, flush=True)
+                    progress_reported[index] = (phase, now)
             codes = [process.poll() for process in processes]
             if any(code is not None and code != 0 for code in codes):
                 failed = True

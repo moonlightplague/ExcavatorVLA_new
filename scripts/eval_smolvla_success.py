@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -27,7 +28,8 @@ from excavator_common.deployment_contract import (
     ACTION_NAMES_4D, sha256_files,
 )
 from excavator_common.evaluation_metrics import EpisodeMetrics, METRIC_DEFINITIONS, failure_mode
-from excavator_common.collection_target import TARGET_METHOD, SAND_INITIALIZATION_METHOD
+from excavator_common.collection_target import TARGET_METHOD
+from excavator_common.simulation_settings import resolve_simulation_settings, apply_simulation_settings
 from excavator_common.evaluation_standard import (
     EVALUATION_STANDARD, TRUCK_COUNT_METHOD, BUCKET_OPEN_RAD, COMPLETION_OBSERVATIONS,
     CompletionTracker, execution_profile,
@@ -39,6 +41,7 @@ from success_eval_runtime import (
     evaluation_provenance,
 )
 from excavator_diagnostics import dataset_initial_pose, reference_episode
+from success_eval_diagnostics import RolloutDiagnostics
 
 CAMERA_IDS = ('0', '1', '2')
 
@@ -140,6 +143,12 @@ def main():
     parser.add_argument('--cpu-threads', type=int, default=0,
                         help='Simulator CPU threads per worker; 0 splits the available CPU quota.')
     parser.add_argument('--startup-timeout', type=float, default=600)
+    parser.add_argument('--soil-backend', choices=['physx', 'newton_mpm'],
+                        help='Soil solver; otherwise use EXCAVATOR_SOIL_BACKEND (default: newton_mpm).')
+    parser.add_argument('--sand-walls-during-settle', action=argparse.BooleanOptionalAction, default=None,
+                        help='Override EXCAVATOR_SAND_WALLS_DURING_SETTLE; Newton disables wall collisions.')
+    parser.add_argument('--progress-interval', type=float, default=15.,
+                        help='Seconds between live progress reports; 0 disables them.')
     parser.add_argument('--worker-index', type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--worker-count', type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument('--gpu-label', default='', help=argparse.SUPPRESS)
@@ -150,6 +159,13 @@ def main():
         parser.error('Worker/thread counts must be nonnegative and startup timeout positive')
     if not np.isfinite(args.startup_timeout) or args.seed < 0 or args.seed + args.episodes > 2**63:
         parser.error('Timeout must be finite and scene seeds must fit nonnegative signed 64-bit integers')
+    if not np.isfinite(args.progress_interval) or args.progress_interval < 0:
+        parser.error('--progress-interval must be finite and nonnegative')
+    try:
+        simulation_settings = resolve_simulation_settings(args.soil_backend, args.sand_walls_during_settle)
+    except ValueError as exc:
+        parser.error(str(exc))
+    apply_simulation_settings(simulation_settings)
     if not args.headless:
         if args.workers > 1:
             parser.error('Multiple GPU workers require headless mode; use --workers 1 for a GUI')
@@ -188,7 +204,8 @@ def main():
     config.update(evaluation_standard=EVALUATION_STANDARD, truck_count_method=TRUCK_COUNT_METHOD,
                   evaluation_profile=execution_profile(args.fresh_simulator, args.render_every_physics_step,
                                                        args.headless, reference is not None))
-    config.update(sand_initialization=SAND_INITIALIZATION_METHOD,
+    config.update(simulation_settings=simulation_settings,
+                  sand_initialization=simulation_settings['sand_initialization_method'],
                   dig_target_method='cli_recorded_dig_target' if reference else TARGET_METHOD)
     config['metric_definitions'] = METRIC_DEFINITIONS
     if args.worker_index is None:
@@ -198,7 +215,7 @@ def main():
             'episodes', 'steps', 'min_particles', 'seed', 'replan_interval', 'training_fps',
             'initial_joints_deg', 'bucket_open_threshold', 'completion_observations',
             'fresh_simulator', 'render_every_physics_step', 'headless', 'execution_source',
-            'sand_initialization', 'dig_target_method')}
+            'sand_initialization', 'dig_target_method', 'simulation_settings')}
         software = {'python': sys.version, 'torch': torch.__version__, 'cuda': torch.version.cuda}
         for package in ('lerobot', 'transformers', 'numpy', 'pillow'):
             software[package] = importlib.metadata.version(package)
@@ -208,10 +225,14 @@ def main():
         atomic_json(args.output / 'config.json', config)
     else:
         saved_config = json.loads((args.output / 'config.json').read_text())
+        if simulation_settings != saved_config['simulation_settings']:
+            raise ValueError('Worker simulation settings differ from the evaluation manifest')
         config.update({key: saved_config[key] for key in ('evaluation_id', 'checkpoint_sha256')})
     if reference and args.worker_index is None:
         (args.output / 'scene_profile.json').write_text(json.dumps(reference['profile'], indent=2) + '\n')
     if args.worker_index is None:
+        print(f"Soil backend: {simulation_settings['soil_backend']}; "
+              f"sand initialization: {config['sand_initialization']}", flush=True)
         gpu_ids = resolve_gpu_ids(args.gpus)
         if args.workers > len(gpu_ids):
             parser.error('--workers cannot exceed the selected GPU count')
@@ -238,6 +259,8 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    worker_dir = args.output / 'workers' / f'worker_{args.worker_index:02d}'
+    atomic_json(worker_dir / 'progress.json', {'phase': 'loading_policy'})
     policy = None
     if not args.replay_reference:
         if args.policy_type == 'pi05':
@@ -288,7 +311,6 @@ def main():
                 policy.config, pretrained_path=str(args.checkpoint),
                 preprocessor_overrides={'device_processor': {'device': 'cuda'}},
             )
-    worker_dir = args.output / 'workers' / f'worker_{args.worker_index:02d}'
     command = [str(BASE / 'run_isaac_python.sh'), str(REPO / 'run_simulation.py'),
                '--sand-amount', str(reference['sand_amount'] if reference else 1),
                '--robot-initial-joints-deg', *map(str, initial_pose),
@@ -336,6 +358,23 @@ def run_episodes(args, info, reference, action_limits, policy,
         status.update(policy_type=getattr(args, 'policy_type', 'smolvla'),
                       clipped_action_dimensions=0, applied_action_dimensions=0)
         metrics = EpisodeMetrics()
+        diagnostics = None
+        progress_path = args.output / 'workers' / f'worker_{args.worker_index:02d}' / 'progress.json'
+        last_progress = 0.
+
+        def report_progress(phase, force=False):
+            nonlocal last_progress
+            now = time.monotonic()
+            if not force and (args.progress_interval == 0 or now - last_progress < args.progress_interval):
+                return
+            atomic_json(progress_path, {
+                'phase': phase, 'episode_index': index,
+                'steps': status['policy_steps_executed'], 'max_steps': args.steps,
+                'payload_particles': metrics.transfer.get('payload_particles', 0),
+                'retained_particles': metrics.transfer.get('retained_particles', 0),
+                'warnings': diagnostics.warnings() if diagnostics is not None else [],
+            })
+            last_progress = now
         policy_start = None
         status['timing_origin'] = 'episode_preparation_start'
         video = (EpisodeVideo(folder / 'evaluation.mp4', index, status['scene_seed'],
@@ -355,6 +394,7 @@ def run_episodes(args, info, reference, action_limits, policy,
         np.random.seed(status['scene_seed'] % (2**32))
         started = time.monotonic()
         try:
+            report_progress('starting_simulator', force=True)
             status.update(session.prepare(status['scene_seed']))
             (folder / 'simulator.log').symlink_to(session.log_path)
             sock = session.sock
@@ -363,6 +403,10 @@ def run_episodes(args, info, reference, action_limits, policy,
                 if scene.get('scene_seed') != status['scene_seed']:
                     raise ValueError(f'Unexpected scene seed: {scene}')
                 atomic_json(folder / 'scene_context.json', scene)
+                if scene.get('simulation_settings') != config['simulation_settings']:
+                    raise ValueError('Simulator soil settings differ from the evaluation manifest')
+                diagnostics = RolloutDiagnostics(scene['canonical_joint_limits_rad'],
+                                                 stall_window_steps=max(2, math.ceil(info['fps'] * 5)))
                 status['kit_pid'] = scene['simulator_pid']
                 contract = build_client_contract(info['fps'], normalization_hash,
                     OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT, scene['observation_context'])
@@ -397,6 +441,7 @@ def run_episodes(args, info, reference, action_limits, policy,
                     policy.reset()
                 actions = []
                 policy_start = time.monotonic()
+                report_progress('rollout', force=True)
                 for step in range(args.steps):
                     step_started = time.perf_counter()
                     policy_latency_ms = None
@@ -433,6 +478,7 @@ def run_episodes(args, info, reference, action_limits, policy,
                     validate_scene_metric(reply, status['scene_seed'])
                     step_latency_ms = (time.perf_counter() - step_started) * 1000
                     metrics.observe(reply, action_step=True)
+                    diagnostics.observe(step, state_post.tolist(), reply['joint_command_positions'], metrics.transfer)
                     metrics.bridge_ms.append(bridge_latency_ms)
                     metrics.step_ms.append(step_latency_ms)
                     # Decoded after the latency sample so step_latency_ms stays
@@ -480,6 +526,7 @@ def run_episodes(args, info, reference, action_limits, policy,
                     trace.flush()
                     if video is not None:
                         video.write(reply, {**status, 'status': 'running'}, stable_steps)
+                    report_progress('rollout')
                     frames = post_action_frames
                     if success and bucket_open:
                         status.update(early_terminated=True, termination_reason='success_and_bucket_open',
@@ -520,6 +567,9 @@ def run_episodes(args, info, reference, action_limits, policy,
                               observed_completion_before_error=bool(status['success']),
                               success=False, task_completed_success_and_bucket_open=False)
             status['failure_mode'] = failure_mode(status)
+            if diagnostics is not None:
+                status['diagnostics'] = diagnostics.summary()
+                atomic_json(folder / 'diagnostics.json', status['diagnostics'])
             if store is not None:
                 try:
                     store.close(status)
@@ -529,6 +579,7 @@ def run_episodes(args, info, reference, action_limits, policy,
                     print(f"Episode {index} trajectory error: {status['trajectory_error']}", flush=True)
                     failed = True
             atomic_json(folder / 'episode_status.json', status)
+            report_progress(status['status'], force=True)
             if args.fresh_simulator or failed:
                 session.close()
         print(f"Episode {index}: {status['status']}, success={status['success']}, "

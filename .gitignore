@@ -8,3 +8,6 @@ models*
 .venv-smolvla/
 .venv-pi05/
 *__pycache__
+.agents/
+.vscode/
+_rl_staging/
