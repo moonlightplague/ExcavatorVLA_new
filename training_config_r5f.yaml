@@ -1,0 +1,85 @@
+# r5f: Best-of-N supervised fine-tune of the 040000 policy on its own
+# high-scoring rollouts. Structurally identical to the 040000 recipe
+# (training_config.yaml); only the dataset, policy.path, learning rate,
+# schedule, seed and step budget differ.
+#
+# What is deliberately NOT changed, and why:
+#   freeze_vision_encoder / train_expert_only / train_state_proj stay at the
+#     baseline values so the only moving parts are the action expert and the
+#     state projection -- the same subset that produced 81.8% success.
+#   chunk_size 10 / n_action_steps 3 / num_steps 10 stay, because the rollout
+#     pool was collected with replan_interval 3 under exactly this chunking.
+#     Changing n_action_steps would desynchronise training from the data.
+#   image_transforms stays disabled. Augmentation would be a reasonable
+#     anti-overfit lever on 70-odd episodes, but it is a second change on top
+#     of the data change and would confound the r5g comparison.
+#   stats stay on the reference dataset (--stats-mode reference at build time),
+#     so the normalizer baked into 040000 keeps its meaning.
+#
+# Learning rate is 2e-5, one fifth of the 1e-4 used to train 040000. This is a
+# continuation from an already-converged checkpoint on ~13k frames, not a cold
+# start on 40k; the baseline rate would move it further than the evidence
+# supports.
+#
+# scheduler_decay_steps must not exceed steps and warmup must be shorter than
+# decay -- build_train_config raises on both, so a short run cannot reuse the
+# baseline's warmup 1000 / decay 20000.
+#
+# Cost, measured rather than estimated. The baseline run logged a steady
+# updt_s of 0.259 at batch_size 16 on both GPUs, so 4000 steps is ~17 minutes
+# and one 100-seed Isaac evaluation of a checkpoint is ~2 hours: evaluation
+# dominates by roughly 7x. lerobot 0.4.4 never prunes checkpoints (there is no
+# delete_checkpoint in the package; the baseline's missing 010000-030000 were
+# removed by hand on Oct 19), so save_freq 1000 leaves 001000..004000 on disk
+# at 1.5 GB each. That ladder is the overfitting guard: 4000 steps is ~4.7
+# epochs over a ~13.5k-frame pool, and r5g scores the ends first (001000 and
+# 004000) and only fills in the middle if they disagree.
+
+dataset:
+  repo_id: local/excavator_r5f_bon
+  root: /root/gpufree-data/ExcavatorVLA_new/outputs/datasets/r5f_bon_t400
+  episodes: null
+  video_backend: pyav
+  image_transforms:
+    enable: false
+
+policy:
+  path: /root/gpufree-data/ExcavatorVLA_new/outputs/train/excavator_smolvla_20261014_190059_474909_268032/checkpoints/040000/pretrained_model
+  device: cuda
+  load_vlm_weights: false        # The full SmolVLA checkpoint restores backbone weights.
+  push_to_hub: false
+  freeze_vision_encoder: true
+  train_expert_only: true
+  train_state_proj: true
+  n_obs_steps: 1
+  chunk_size: 10
+  n_action_steps: 3
+  num_steps: 10
+  tokenizer_max_length: 64
+  optimizer_lr: 0.00002
+  optimizer_weight_decay: 0.0000000001
+  optimizer_grad_clip_norm: 10.0
+  scheduler_warmup_steps: 100
+  scheduler_decay_steps: 4000
+  scheduler_decay_lr: 0.0000005  # 2.5% of peak, the baseline's ratio.
+
+steps: 4000
+batch_size: 16
+num_workers: 8
+seed: 2000                       # Distinct from the baseline's 1000.
+save_freq: 1000
+log_freq: 100
+eval_freq: 0                     # Isaac success evaluation is run separately (r5g).
+save_checkpoint: true
+job_name: excavator_smolvla_r5f_bon
+output_dir: null
+
+wandb:
+  enable: false
+  project: excavator-smolvla
+
+launcher:
+  output_root: /root/gpufree-data/ExcavatorVLA_new/outputs/train
+  hf_home: /root/gpufree-data/ExcavatorVLA_new/models/hf-cache
+  gpu_ids: [0, 1]
+  mixed_precision: bf16
