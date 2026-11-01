@@ -52,7 +52,9 @@ its bundled Python; `POLICY_PYTHON` uses the active `ExcavatorVLA` environment.
 
 For repeated digging, unloading across low areas of the truck bed, and recorded
 physical arm returns, run `./collect_repeat.sh 50 2 0,1 3`. Each episode contains
-three complete cycles in one scene. Output defaults to `data/repeat/{raw,export}`.
+three complete cycles in one scene. Successful episodes export immediately to
+`data/repeat/export_repeat`; validated episodes retain only metrics in `raw`.
+Combined batch totals and averages are saved under `data/repeat/metrics`.
 See [baseline/README.md](baseline/README.md) for options, validation, and SmolVLA training.
 
 At least 8GB of VRAM is required for an atomic simulation process.

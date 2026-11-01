@@ -12,6 +12,8 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     echo 'Usage: ./collect_repeat.sh <successful_episodes> [workers=1] [gpu_ids=0] [scoops=3] [baseline/Isaac options...]'
     echo 'Example: ./collect_repeat.sh 10 2 0,1 3'
     echo 'Default output: data/repeat/{raw,export_repeat}; override DATA_ROOT, EXPORT_DIR and POLICY_PYTHON as needed.'
+    echo 'Each successful episode exports immediately; raw retains metrics only after validated export.'
+    echo 'Combined batch metrics and averages: data/repeat/metrics/repeat_*_summary.json.'
     echo 'See baseline/README.md; baseline/collect_repeat.py --help lists baseline options.'
     return
 fi
@@ -49,14 +51,17 @@ if ! "$POLICY_PYTHON" -c 'import numpy, pandas, pyarrow, imageio_ffmpeg'; then
     echo "Set POLICY_PYTHON to your training Python with numpy, pandas, pyarrow and imageio-ffmpeg installed." >&2
     exit 2
 fi
+POLICY_ENV_JSON="$("$POLICY_PYTHON" -c 'import json,os; print(json.dumps({key:os.environ.get(key) for key in ("PATH", "PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "LD_PRELOAD")}))')"
 # Resolve before changing directory; callers may supply a relative DATA_ROOT.
 mkdir -p "$DATA_ROOT"
 DATA_ROOT="$(cd "$DATA_ROOT" && pwd)"
 EXPORT_DIR="$("$POLICY_PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "${EXPORT_DIR:-$DATA_ROOT/export_repeat}")"
 BATCH_ID="repeat_$(date +%Y%m%d_%H%M%S)_$$"
 LOG_ROOT="$DATA_ROOT/raw/.collection_logs/$BATCH_ID"
+METRICS_FILE="$DATA_ROOT/metrics/${BATCH_ID}_summary.json"
 mkdir -p "$LOG_ROOT"
 PIDS=()
+BATCH_STATUS=failed
 cleanup() {
     local pid
     for pid in "${PIDS[@]}"; do
@@ -70,12 +75,27 @@ cleanup() {
         done
     fi
 }
-trap cleanup EXIT
+finish_collection() {
+    local status=$?
+    trap - EXIT
+    cleanup
+    if (( status == 130 || status == 143 )); then BATCH_STATUS=interrupted; fi
+    if ! "$POLICY_PYTHON" "$BASE/baseline/metrics_summary.py" \
+        --raw-root "$DATA_ROOT/raw" --batch-id "$BATCH_ID" \
+        --export-dir "$EXPORT_DIR" --requested "$COUNT" \
+        --status "$BATCH_STATUS" --output "$METRICS_FILE"; then
+        echo "Failed to write combined metrics: $METRICS_FILE" >&2
+        status=1
+    fi
+    exit "$status"
+}
+trap finish_collection EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo "Collecting $COUNT successful episodes, $SCOOPS dig/unload/physical-return cycles each, with $WORKERS worker(s), GPUs=$GPU_IDS"
 echo "Worker logs and results: $LOG_ROOT"
+echo "Streaming export: $EXPORT_DIR; combined metrics: $METRICS_FILE"
 echo "Progress is reported every ${STATUS_SECONDS}s; scene/RTX initialization can take several minutes."
 cd "$ISAAC_REPO"
 REMAINING="$COUNT"
@@ -93,12 +113,14 @@ while (( REMAINING > 0 )); do
         EXCAVATOR_AUTO_RUN_ID_SUFFIX="${BATCH_ID}_r${ROUND}_w${WORKER}" \
         EXCAVATOR_AUTO_COLLECT_RESULT_FILE="$ROUND_DIR/worker_$WORKER.result.json" \
         EXCAVATOR_KIT_LOG_FILE="$ROUND_DIR/worker_$WORKER.kit.log" \
+        REPEAT_POLICY_ENV="$POLICY_ENV_JSON" \
         PYTHONUNBUFFERED=1 \
         setsid "$ISAAC_PYTHON" "$BASE/baseline/collect_repeat.py" \
             --max-attempts "$((TARGET * 5))" \
             --sand-amount "${SAND_AMOUNT:-1.0}" "${EXTRA_ARGS[@]}" \
             --active-gpu "$GPU" --physics-gpu "$GPU" --success-count "$TARGET" \
             --dataset-root "$DATA_ROOT/raw" --scoops-per-episode "$SCOOPS" \
+            --stream-export-dir "$EXPORT_DIR" --policy-python "$POLICY_PYTHON" \
             >"$ROUND_DIR/worker_$WORKER.log" 2>&1 &
         PIDS+=("$!")
     done
@@ -153,6 +175,8 @@ if successes > result["requested"]:
     raise SystemExit("Collection returned more successes than requested.")
 if not result.get("run_dir"):
     raise SystemExit("Collection result has no raw run directory.")
+if str(result.get("loop_exit_reason", "")).startswith("exception:"):
+    raise SystemExit("Collection failed: " + result["loop_exit_reason"])
 print(result["run_dir"])
 print(successes)
 PYCODE
@@ -164,16 +188,14 @@ PYCODE
             FAILED=1
             continue
         fi
-        # Only the parent exports, so workers never contend for the append lock.
-        for (( EPISODE=0; EPISODE<SUCCESSES; EPISODE++ )); do
-            "$POLICY_PYTHON" excavator_dataset_tools.py "$RUN" \
-                --export-lerobot-v3 --export-append \
-                --export-offset "$EPISODE" --export-limit 1 \
-                --export-dir "$EXPORT_DIR" \
-                --export-state-schema current-v4 --export-effort-policy exclude \
-                --export-require-standard --export-require-vla \
-                2>&1 | tee "$RUN/export_episode_${EPISODE}.log"
-        done
+        # Workers already exported and pruned before recording another episode.
+        # A simulation success alone cannot count as a committed export.
+        if ! "$POLICY_PYTHON" "$BASE/baseline/stream_export.py" \
+            --run-dir "$RUN" --export-dir "$EXPORT_DIR" --verify-successes "$SUCCESSES"; then
+            echo "Worker $WORKER has missing export/cleanup receipts; raw files retained." >&2
+            FAILED=1
+            continue
+        fi
         GAINED=$((GAINED + SUCCESSES))
     done
     REMAINING=$((REMAINING - GAINED))
@@ -183,6 +205,7 @@ PYCODE
         exit 1
     fi
 done
+BATCH_STATUS=complete
 }
 
 # Parse the exit together with the call so Bash never rereads an edited file.
