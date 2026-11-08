@@ -42,6 +42,7 @@ from success_eval_runtime import (
 )
 from excavator_diagnostics import dataset_initial_pose, reference_episode
 from success_eval_diagnostics import RolloutDiagnostics
+from collection_eval_scenes import load_scene_manifest, simulator_command as collection_scene_command
 
 CAMERA_IDS = ('0', '1', '2')
 
@@ -124,7 +125,11 @@ def main():
     parser.add_argument('--initial-episode', type=int, default=0,
                         help='Use this dataset episode initial joint pose for randomized scenes.')
     parser.add_argument('--reference-episode', type=Path,
-                        help='Raw successful episode directory; reproduce its scene, pose, targets and task.')
+                        help='Raw successful episode directory or source-recorded reference setup JSON; '
+                             'reproduce its scene, pose, targets and task.')
+    parser.add_argument('--scene-manifest', type=Path,
+                        help='New scenes prepared by the collection planner, including per-scene '
+                             'initial poses and feasible dig/unload targets. Requires fresh simulators.')
     parser.add_argument('--replay-reference', action='store_true',
                         help='Execute reference expert actions instead of model actions to test the simulator.')
     parser.add_argument('--workers', type=int, default=0,
@@ -183,7 +188,15 @@ def main():
     if args.replay_reference and args.reference_episode is None:
         parser.error('--replay-reference requires --reference-episode')
     reference = reference_episode(args.reference_episode, info['fps']) if args.reference_episode else None
-    initial_pose = reference['initial_joints_deg'] if reference else dataset_initial_pose(args.dataset, args.initial_episode)
+    if args.scene_manifest and (reference or args.replay_reference or not args.fresh_simulator):
+        parser.error('--scene-manifest requires fresh simulators and cannot be mixed with reference replay')
+    scene_manifest_hash = None
+    if args.scene_manifest:
+        args.scene_manifest = args.scene_manifest.resolve()
+        _, scene_manifest_hash = load_scene_manifest(args.scene_manifest, args.episodes,
+                                                    simulation_settings['soil_backend'])
+    initial_pose = (None if args.scene_manifest else reference['initial_joints_deg'] if reference
+                    else dataset_initial_pose(args.dataset, args.initial_episode))
     action_limits = np.asarray(info['action_limits_rad_s'], dtype=np.float32)
     if action_limits.shape != (4,) or not np.isfinite(action_limits).all() or np.any(action_limits <= 0):
         raise ValueError('Invalid dataset action limits')
@@ -207,7 +220,16 @@ def main():
     config.update(simulation_settings=simulation_settings,
                   sand_initialization=simulation_settings['sand_initialization_method'],
                   dig_target_method='cli_recorded_dig_target' if reference else TARGET_METHOD)
+    config.update(unload_target_method='reference_recorded' if reference else 'truck_bed_center',
+                  initial_pose_method='reference_recorded' if reference else 'fixed_dataset_episode')
+    if args.scene_manifest:
+        config.update(scene_manifest_sha256=scene_manifest_hash,
+                      scene_distribution='collection_sampler_and_first_cycle_planner',
+                      dig_target_method='collection_first_cycle_plan',
+                      unload_target_method='repeat_flat_fill_v2', initial_pose_method='collection_repeat_pile_facing')
     config['metric_definitions'] = METRIC_DEFINITIONS
+    if args.reference_episode and args.reference_episode.is_file():
+        config['reference_setup_sha256'] = hashlib.sha256(args.reference_episode.read_bytes()).hexdigest()
     if args.worker_index is None:
         args.output.mkdir(parents=True, exist_ok=False)
         protocol = {key: config[key] for key in (
@@ -216,6 +238,11 @@ def main():
             'initial_joints_deg', 'bucket_open_threshold', 'completion_observations',
             'fresh_simulator', 'render_every_physics_step', 'headless', 'execution_source',
             'sand_initialization', 'dig_target_method', 'simulation_settings')}
+        if 'reference_setup_sha256' in config:
+            protocol['reference_setup_sha256'] = config['reference_setup_sha256']
+        protocol.update({key: config[key] for key in ('unload_target_method', 'initial_pose_method')})
+        if args.scene_manifest:
+            protocol['scene_manifest_sha256'] = scene_manifest_hash
         software = {'python': sys.version, 'torch': torch.__version__, 'cuda': torch.version.cuda}
         for package in ('lerobot', 'transformers', 'numpy', 'pillow'):
             software[package] = importlib.metadata.version(package)
@@ -313,8 +340,9 @@ def main():
             )
     command = [str(BASE / 'run_isaac_python.sh'), str(REPO / 'run_simulation.py'),
                '--sand-amount', str(reference['sand_amount'] if reference else 1),
-               '--robot-initial-joints-deg', *map(str, initial_pose),
                '--active-cuda-gpu', '0', '--cpu-threads', str(args.cpu_threads or 16)]
+    if initial_pose is not None:
+        command += ['--robot-initial-joints-deg', *map(str, initial_pose)]
     if args.headless:
         command.extend(['--headless', '--idle-ui-hz', '0.1'])
     command.append('--render-every-physics-step' if args.render_every_physics_step
@@ -338,6 +366,13 @@ def main():
 
 def run_episodes(args, info, reference, action_limits, policy,
                  preprocess, postprocess, normalization_hash, config, session):
+    prepared_scenes = None
+    if getattr(args, 'scene_manifest', None):
+        prepared_scenes, digest = load_scene_manifest(args.scene_manifest, args.episodes,
+                                                     config['simulation_settings']['soil_backend'])
+        if digest != config['scene_manifest_sha256']:
+            raise ValueError('Collection scene manifest changed after evaluation started')
+    base_simulator_command = list(session.command)
     trajectory_store = None
     if args.save_trajectory:
         # Imported on demand so a simulator-only checkout can still evaluate.
@@ -352,6 +387,12 @@ def run_episodes(args, info, reference, action_limits, policy,
                   'policy_steps_inferred': 0, 'policy_steps_executed': 0,
                   'early_terminated': False, 'error': None, 'scene_seed': args.seed + index - 1}
         status.update(worker_index=args.worker_index, gpu_id=args.gpu_label)
+        prepared_scene = prepared_scenes[index - 1] if prepared_scenes else None
+        if prepared_scene is not None:
+            status.update(scene_seed=prepared_scene['scene_seed'],
+                          scene_manifest_sha256=config['scene_manifest_sha256'],
+                          unload_target_method=config['unload_target_method'])
+            session.command = collection_scene_command(base_simulator_command, prepared_scene, folder)
         status.update(min_particles=args.min_particles, execution_source=config['execution_source'])
         status.update({key: config[key] for key in (
             'evaluation_standard', 'evaluation_profile', 'evaluation_id', 'checkpoint_sha256')})
@@ -424,6 +465,14 @@ def run_episodes(args, info, reference, action_limits, policy,
                 initial_report = {'state': initial_state.tolist(), 'task': reply['task_text'],
                                   'camera_sha256': frame_hashes(frames),
                                   'truck_bed_load_metrics': reply['truck_bed_load_metrics']}
+                if prepared_scene is not None:
+                    error = initial_state[:4] - np.radians(prepared_scene['initial_joints_deg'])
+                    initial_report.update(collection_initial_joint_error_rad=error.tolist(),
+                                          collection_selected_landing=prepared_scene['selection'])
+                    if np.max(np.abs(error)) > 5e-4:
+                        raise ValueError('Initial joints differ from the collection-prepared scene')
+                    if reply['task_text'] != prepared_scene['task']:
+                        raise ValueError('Task differs from the collection-prepared instruction')
                 if reference:
                     initial_report['reference_state_error'] = (initial_state - reference['expected_initial_state']).tolist()
                 (folder / 'initial_observation.json').write_text(json.dumps(initial_report, indent=2) + '\n')

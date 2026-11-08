@@ -33,8 +33,14 @@ def evaluation_provenance(base, checkpoint, dataset, protocol, software):
                simulator / 'scripts/evaluation/summarize_isaacsim_success_rate.py',
                *[base / 'scripts' / name for name in (
                    'eval_smolvla_success.py', 'success_eval_runtime.py', 'eval_video.py',
-                   'excavator_diagnostics.py', 'success_eval_diagnostics.py')],
+                   'excavator_diagnostics.py', 'success_eval_diagnostics.py',
+                   'collection_eval_scenes.py')],
                base / 'ExcavatorVLA-isaac/assets/usd/excavator_scene.usd', base / 'run_isaac_python.sh']
+    if protocol.get('scene_manifest_sha256'):
+        sources.extend((base / 'baseline').glob('*.py'))
+        sources.extend((base / 'ExcavatorVLA-isaac/scripts/excavator_app').glob('*.py'))
+        sources.extend((base / 'ExcavatorVLA-isaac/excavator_common').glob('*.py'))
+        sources.append(base / 'ExcavatorVLA-isaac/run_vla_train_scene.py')
     checkpoint_files = file_manifest([p for p in checkpoint.rglob('*') if p.is_file()], checkpoint)
     source_files = file_manifest(sources, base)
     metadata = file_manifest([dataset / 'meta/info.json'], dataset)

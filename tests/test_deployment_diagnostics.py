@@ -1,9 +1,12 @@
 import importlib.util
 import ast
 import math
+import copy
+import json
 from pathlib import Path
 import sys
 import unittest
+import tempfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,9 +19,49 @@ from excavator_diagnostics import dataset_initial_pose, exporter_module, referen
 from excavator_common.deployment_scene_contract import (
     relative_task_text, truck_clears_robot_body, sample_random_scene_profile,
 )
+from excavator_common.vla_observation_contract import STATE_NAMES_28D, ACTION_NAMES_4D
 
 
 class DeploymentDiagnosticsTests(unittest.TestCase):
+    def reference_setup_payload(self):
+        state = [.2, .3, -.4, -.5] + [0.] * 24
+        return dict(schema_version='excavator_reference_setup_v1', fps=10, action_units='rad/s',
+                    state_names=list(STATE_NAMES_28D), action_names=list(ACTION_NAMES_4D),
+                    profile=dict(sand_xy=[1., 2.], truck_translation_xyz=[-5., -8., 0.],
+                                 truck_yaw_deg=-100., unload_landing_xyz=[-6., -7., 4.]),
+                    task='Load the truck.', initial_joints_deg=np.degrees(state[:4]).tolist(),
+                    dig_target_xyz=[1., 2., .2], sand_amount=1., expected_initial_state=state,
+                    actions=[[.1, .2, .3, .4], [0., -.2, .1, -.3], [.5, 0., 0., .2]],
+                    provenance={'kind': 'test_recorded_setup'})
+
+    def test_reference_setup_preserves_exported_action_alignment(self):
+        payload = self.reference_setup_payload()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'setup.json'
+            path.write_text(json.dumps(payload))
+            reference = reference_episode(path, 10)
+        np.testing.assert_allclose(reference['actions'], payload['actions'], atol=1e-7)
+        np.testing.assert_array_equal(reference['expected_initial_state'], payload['expected_initial_state'])
+        self.assertEqual(reference['profile'], payload['profile'])
+
+    def test_reference_setup_rejects_wrong_fps_units_order_and_pose(self):
+        original = self.reference_setup_payload()
+        variants = []
+        for key, value in [('fps', 20), ('action_units', 'rad'), ('provenance', {}),
+                           ('initial_joints_deg', [0., 0., 0., 0.]),
+                           ('actions', [[0., 0., float('nan'), 0.]]),
+                           ('action_names', list(reversed(ACTION_NAMES_4D)))]:
+            payload = copy.deepcopy(original)
+            payload[key] = value
+            variants.append((key, payload))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'setup.json'
+            for key, payload in variants:
+                with self.subTest(field=key):
+                    path.write_text(json.dumps(payload))
+                    with self.assertRaises(ValueError):
+                        reference_episode(path, 10)
+
     def test_long_truck_is_rejected_even_if_its_center_is_far_away(self):
         self.assertFalse(truck_clears_robot_body([0, 0], [-1, 1, 0], [1, 11, 5]))
         self.assertTrue(truck_clears_robot_body([0, 0], [-1, 3, 0], [1, 13, 5]))

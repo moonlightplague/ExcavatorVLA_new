@@ -252,6 +252,7 @@ class RolloutIntegrationTests(unittest.TestCase):
 
         policy.predict_action_chunk.side_effect = infer
         session = Mock(log_path=Path(directory) / 'simulator.log')
+        session.command = []
         (Path(directory) / 'workers' / 'worker_00').mkdir(parents=True)
         sequences = []
 

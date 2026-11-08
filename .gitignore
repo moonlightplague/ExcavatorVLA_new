@@ -31,3 +31,6 @@ _rl_staging/
 .coverage
 .coverage.*
 htmlcov/
+
+# Standalone generated evaluation media
+/output.mp4

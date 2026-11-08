@@ -37,6 +37,8 @@ def dataset_initial_pose(root, episode_index=0):
 
 def reference_episode(path, fps):
     path = Path(path)
+    if path.is_file():
+        return reference_setup(path, fps)
     meta = json.loads((path / 'meta.json').read_text())
     if not meta.get('success'):
         raise ValueError('Reference must be a successful expert episode')
@@ -59,3 +61,43 @@ def reference_episode(path, fps):
         'expected_initial_state': samples[0]['observation.state'],
         'actions': np.asarray([row['action'] for row in transformed['samples']], dtype=np.float32),
     }
+
+
+def reference_setup(path, fps):
+    """Load an explicit, source-recorded setup without requiring raw images.
+
+    This is a distinct format, not a fabricated raw episode. Exported actions
+    are already at the requested control cadence and must not be shifted again.
+    """
+    from excavator_common.vla_observation_contract import STATE_NAMES_28D, ACTION_NAMES_4D
+
+    data = json.loads(Path(path).read_text())
+    if (data.get('schema_version') != 'excavator_reference_setup_v1'
+            or data.get('fps') != fps or data.get('action_units') != 'rad/s'):
+        raise ValueError('Reference setup schema, action units or control FPS differ')
+    if data.get('state_names') != list(STATE_NAMES_28D) or data.get('action_names') != list(ACTION_NAMES_4D):
+        raise ValueError('Reference setup state/action order differs from deployment')
+    if not data.get('provenance') or not isinstance(data.get('task'), str) or not data['task'].strip():
+        raise ValueError('Reference setup requires task text and recorded source provenance')
+    result = {key: data[key] for key in ('profile', 'task', 'initial_joints_deg',
+                                        'dig_target_xyz', 'sand_amount', 'expected_initial_state')}
+    for name, shape in [('initial_joints_deg', (4,)), ('dig_target_xyz', (3,)),
+                        ('expected_initial_state', (28,))]:
+        value = np.asarray(result[name], dtype=np.float64)
+        if value.shape != shape or not np.isfinite(value).all():
+            raise ValueError(f'Invalid finite reference {name}: expected {shape}')
+    for name, shape in [('sand_xy', (2,)), ('truck_translation_xyz', (3,)),
+                        ('truck_yaw_deg', ()), ('unload_landing_xyz', (3,))]:
+        value = np.asarray(result['profile'][name], dtype=np.float64)
+        if value.shape != shape or not np.isfinite(value).all():
+            raise ValueError(f'Invalid finite reference profile {name}')
+    if not np.isfinite(result['sand_amount']) or result['sand_amount'] <= 0:
+        raise ValueError('Reference sand amount must be finite and positive')
+    if not np.allclose(np.degrees(result['expected_initial_state'][:4]),
+                       result['initial_joints_deg'], rtol=0, atol=1e-5):
+        raise ValueError('Reference initial pose and expected state disagree')
+    actions = np.asarray(data['actions'], dtype=np.float32)
+    if actions.ndim != 2 or actions.shape[1] != 4 or not len(actions) or not np.isfinite(actions).all():
+        raise ValueError('Reference setup requires nonempty finite [T,4] exported actions')
+    result['actions'] = actions
+    return result

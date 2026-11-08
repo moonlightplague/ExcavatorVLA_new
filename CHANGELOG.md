@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-08 — PI05 PhysX training and evaluation
+
+- Update the VLM submodule with verified-backend single-cycle PI05 training, continuation, and checkpoint-comparison tools.
+- Support source-recorded reference setups and collection-prepared scene manifests in the shared evaluator, including per-scene initial poses, targets, and provenance hashes.
+- Add the collection-matched multi-GPU evaluation runner, scene validation, regression coverage, and protocol documentation; update the baseline scene-preparation dependency.
+- Ignore the standalone generated output video; datasets, model weights, checkpoints, logs, and evaluation outputs remain outside these commits.
+
 ## 2026-10-30 — Repeated digging and repository maintenance
 
 - Update the baseline to use continuous collision-checked cuts and record per-episode transfer, timing, throughput, and bed-fill metrics, including failures.
