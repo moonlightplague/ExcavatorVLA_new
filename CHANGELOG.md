@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-09 — Newton ten-cycle repeat tuning
+
+- Add reachable side-loading and source-ID episode acceptance options to the repeat baseline, with a fixed-attempt acceptance benchmark and retained strict counterfactual decisions.
+- Repair Newton thin static-shell tunneling using actual collision triangles and sync the collection and deployment soil adapters.
+- Document repeat collection failures, parameter choices and acceptance semantics in `baseline/TUNING.md`; preserve the original user collection data.
+- Measure 2/4 validated ten-round Newton exports under explicit episode efficiency acceptance (1/4 strict-equivalent); validate both publications and the LeRobot loader, retaining the full outcome/uncertainty report in `baseline/VALIDATION.md`.
+
 ## 2026-11-09 — PI05 repeated-data repair experiment
 
 - Record experimental action-limit profiles in evaluation provenance and reject silent model/profile mismatches.

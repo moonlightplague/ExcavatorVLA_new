@@ -9,8 +9,9 @@ ISAAC_REPO="$BASE/ExcavatorVLA-isaac"
 ISAAC_PYTHON="${ISAAC_PYTHON:-$BASE/run_isaac_python.sh}"
 POLICY_PYTHON="${POLICY_PYTHON:-$(command -v python)}"
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
-    echo 'Usage: ./collect_repeat.sh <successful_episodes> [workers=1] [gpu_ids=0] [scoops=3] [baseline/Isaac options...]'
-    echo 'Example: ./collect_repeat.sh 10 2 0,1 3'
+    echo 'Usage: ./collect_repeat.sh <successful_episodes> [workers=1] [gpu_ids=0] [scoops=10] [baseline/Isaac options...]'
+    echo 'Example: ./collect_repeat.sh 10 2 0,1 10'
+    echo 'Defaults: Newton MPM, reachable side loading, sand amount 3, episode efficiency acceptance; see baseline/TUNING.md.'
     echo 'Default output: data/repeat/{raw,export_repeat}; override DATA_ROOT, EXPORT_DIR and POLICY_PYTHON as needed.'
     echo 'Each successful episode exports immediately; raw retains metrics only after validated export.'
     echo 'Combined batch metrics and averages: data/repeat/metrics/repeat_*_summary.json.'
@@ -20,7 +21,7 @@ fi
 DATA_ROOT="${DATA_ROOT:-$BASE/data/repeat}"
 COUNT="${1:?Usage: ./collect_repeat.sh <successful_episodes> [workers] [gpu_ids] [scoops]}"
 WORKERS="${2:-${WORKERS:-1}}"
-SCOOPS="${4:-${SCOOPS_PER_EPISODE:-3}}"
+SCOOPS="${4:-${SCOOPS_PER_EPISODE:-10}}"
 STATUS_SECONDS="${COLLECT_STATUS_SECONDS:-15}"
 [[ "$COUNT" =~ ^[1-9][0-9]*$ && "$WORKERS" =~ ^[1-9][0-9]*$ ]] || {
     echo "Success count and workers must be positive integers." >&2
@@ -117,7 +118,7 @@ while (( REMAINING > 0 )); do
         PYTHONUNBUFFERED=1 \
         setsid "$ISAAC_PYTHON" "$BASE/baseline/collect_repeat.py" \
             --max-attempts "$((TARGET * 5))" \
-            --sand-amount "${SAND_AMOUNT:-1.0}" "${EXTRA_ARGS[@]}" \
+            --sand-amount "${SAND_AMOUNT:-3.0}" "${EXTRA_ARGS[@]}" \
             --active-gpu "$GPU" --physics-gpu "$GPU" --success-count "$TARGET" \
             --dataset-root "$DATA_ROOT/raw" --scoops-per-episode "$SCOOPS" \
             --stream-export-dir "$EXPORT_DIR" --policy-python "$POLICY_PYTHON" \
