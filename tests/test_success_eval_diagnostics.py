@@ -68,7 +68,9 @@ class SimulationSettingsTests(unittest.TestCase):
                 'ExcavatorVLA-isaac/assets/usd/excavator_scene.usd', 'run_isaac_python.sh',
                 'scripts/eval_smolvla_success.py', 'scripts/success_eval_runtime.py',
                 'scripts/eval_video.py', 'scripts/excavator_diagnostics.py',
-                'scripts/success_eval_diagnostics.py', 'scripts/collection_eval_scenes.py',
+                'scripts/success_eval_diagnostics.py', 'scripts/act_temporal_ensemble.py',
+                'scripts/act_carry_guard.py', 'scripts/collection_eval_scenes.py',
+                'scripts/spillage_diagnostics.py',
                 'checkpoint/model.safetensors',
                 'dataset/meta/info.json', 'isaacsim/VERSION',
             ]

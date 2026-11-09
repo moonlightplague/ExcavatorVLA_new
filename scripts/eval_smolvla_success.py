@@ -42,6 +42,9 @@ from success_eval_runtime import (
 )
 from excavator_diagnostics import dataset_initial_pose, reference_episode
 from success_eval_diagnostics import RolloutDiagnostics
+from act_temporal_ensemble import TemporalActionEnsemble
+from act_carry_guard import CarryAttitudeGuard, CarryGuardSettings, settings_dict as carry_guard_settings
+from spillage_diagnostics import observe_after_rollout
 from collection_eval_scenes import load_scene_manifest, simulator_command as collection_scene_command
 
 CAMERA_IDS = ('0', '1', '2')
@@ -122,6 +125,29 @@ def main():
     parser.add_argument('--min-particles', type=int, default=100)
     parser.add_argument('--seed', type=int, default=2)
     parser.add_argument('--replan-interval', type=int, default=3)
+    parser.add_argument('--act-temporal-window', type=int, default=0,
+                        help='ACT only: blend this many recent overlapping chunks at each action; '
+                             '0 retains ordinary chunk execution. Requires --replan-interval 1.')
+    parser.add_argument('--act-temporal-decay', type=float, default=.5,
+                        help='ACT ensemble weights exp(-decay * prediction_age); newer chunks weigh more.')
+    parser.add_argument('--act-carry-guard', action='store_true',
+                        help='Explicit ACT hybrid: constrain carry attitude until current bed geometry allows dumping.')
+    parser.add_argument('--act-carry-parent-projection', choices=['balanced', 'arm_first'], default='arm_first',
+                        help='Carry correction distribution (default: arm_first).')
+    parser.add_argument('--act-carry-release-geometry', choices=['current', 'opening_pose', 'load_point', 'load_and_pour'], default='load_point',
+                        help='Carry release geometry (default: load_point).')
+    parser.add_argument('--act-carry-release-interlock', action=argparse.BooleanOptionalAction, default=False,
+                        help='Hold the integrated bucket target closed until release; experimental and disabled by default.')
+    parser.add_argument('--act-carry-max-pitch-deg', type=float, default=-130.,
+                        help='ACT carry-pitch upper bound in degrees; more negative values curl more tightly.')
+    parser.add_argument('--act-carry-near-bed-relax-m', type=float, default=0.,
+                        help='Linearly relax carry pitch toward -130 degrees within this XY distance from the bed; 0 disables.')
+    parser.add_argument('--act-carry-opening-near-edge-m', type=float, default=.3,
+                        help='Allow predicted opening-pose validation this far outside the bed edge.')
+    parser.add_argument('--act-carry-opening-target-rad', type=float, default=-.8,
+                        help='Bucket angle used to predict the landing point after release.')
+    parser.add_argument('--post-rollout-observe-steps', type=int, default=0,
+                        help='Separate zero-command diagnostic after scoring stops; does not change success.')
     parser.add_argument('--initial-episode', type=int, default=0,
                         help='Use this dataset episode initial joint pose for randomized scenes.')
     parser.add_argument('--reference-episode', type=Path,
@@ -132,6 +158,11 @@ def main():
                              'initial poses and feasible dig/unload targets. Requires fresh simulators.')
     parser.add_argument('--replay-reference', action='store_true',
                         help='Execute reference expert actions instead of model actions to test the simulator.')
+    parser.add_argument('--replay-full-reference', action='store_true',
+                        help='Expert diagnostic only: execute the entire recorded sequence, without stopping '
+                             'at the first successful scoop. Requires --replay-reference.')
+    parser.add_argument('--expert-prefix-steps', type=int, default=0,
+                        help='Diagnostic only: recorded expert prefix before model takeover in the reference scene.')
     parser.add_argument('--workers', type=int, default=0,
                         help='Policy workers; 0 uses one per visible GPU (capped by episodes).')
     parser.add_argument('--gpus', help='Physical GPU indices or UUIDs, e.g. 0,1; respects CUDA_VISIBLE_DEVICES.')
@@ -160,8 +191,26 @@ def main():
     args = parser.parse_args()
     if min(args.episodes, args.steps, args.min_particles, args.replan_interval) < 1:
         parser.error('Episode, step, particle and replanning counts must be positive')
+    if (args.act_temporal_window < 0 or not np.isfinite(args.act_temporal_decay)
+            or args.act_temporal_decay < 0):
+        parser.error('ACT temporal window/decay must be nonnegative and decay finite')
+    if args.act_temporal_window and (args.policy_type != 'act' or args.replan_interval != 1
+                                     or args.replay_reference):
+        parser.error('ACT temporal ensembling requires an ACT model, replan interval 1, and no expert replay')
+    if args.act_carry_guard and (args.policy_type != 'act' or args.replay_reference):
+        parser.error('Carry guard requires an ACT model and cannot modify expert replay')
+    if not 0 <= args.post_rollout_observe_steps <= 100:
+        parser.error('Post-rollout observation steps must be in [0,100]')
     if args.workers < 0 or args.cpu_threads < 0 or args.startup_timeout <= 0:
         parser.error('Worker/thread counts must be nonnegative and startup timeout positive')
+    if not np.isfinite(args.act_carry_max_pitch_deg) or not -179. <= args.act_carry_max_pitch_deg <= -90.:
+        parser.error('--act-carry-max-pitch-deg must be finite and in [-179, -90]')
+    if not np.isfinite(args.act_carry_near_bed_relax_m) or not 0. <= args.act_carry_near_bed_relax_m <= 5.:
+        parser.error('--act-carry-near-bed-relax-m must be finite and in [0, 5]')
+    if not np.isfinite(args.act_carry_opening_near_edge_m) or not 0. <= args.act_carry_opening_near_edge_m <= 1.:
+        parser.error('--act-carry-opening-near-edge-m must be finite and in [0, 1]')
+    if not np.isfinite(args.act_carry_opening_target_rad) or not -.8 <= args.act_carry_opening_target_rad <= 0.:
+        parser.error('--act-carry-opening-target-rad must be finite and in [-0.8, 0]')
     if not np.isfinite(args.startup_timeout) or args.seed < 0 or args.seed + args.episodes > 2**63:
         parser.error('Timeout must be finite and scene seeds must fit nonnegative signed 64-bit integers')
     if not np.isfinite(args.progress_interval) or args.progress_interval < 0:
@@ -185,9 +234,21 @@ def main():
     if not args.checkpoint.is_dir():
         parser.error(f'Checkpoint directory does not exist: {args.checkpoint}')
     info = json.loads((args.dataset / 'meta/info.json').read_text())
+    if args.policy_type == 'pi05':
+        from excavator_vlm.data.action_limits import action_contract, check_checkpoint_contract
+        action_contract(info)
+        if not args.replay_reference:
+            check_checkpoint_contract(json.loads((args.checkpoint / 'checkpoint.json').read_text()), info)
     if args.replay_reference and args.reference_episode is None:
         parser.error('--replay-reference requires --reference-episode')
     reference = reference_episode(args.reference_episode, info['fps']) if args.reference_episode else None
+    if args.replay_full_reference and (not args.replay_reference or reference is None
+                                       or args.steps < len(reference['actions'])):
+        parser.error('Full reference replay requires expert replay and a step budget covering all actions')
+    if (args.expert_prefix_steps < 0 or (args.expert_prefix_steps and
+            (reference is None or args.replay_reference or args.expert_prefix_steps >= len(reference['actions'])
+             or args.expert_prefix_steps >= args.steps))):
+        parser.error('Expert prefix requires a reference scene, a shorter positive prefix, and model takeover')
     if args.scene_manifest and (reference or args.replay_reference or not args.fresh_simulator):
         parser.error('--scene-manifest requires fresh simulators and cannot be mixed with reference replay')
     scene_manifest_hash = None
@@ -214,6 +275,21 @@ def main():
     config.update(training_fps=info['fps'], supervisor=False, bucket_open_threshold=BUCKET_OPEN_RAD,
                   completion_observations=COMPLETION_OBSERVATIONS, simulator=str(REPO / 'run_simulation.py'),
                   initial_joints_deg=initial_pose, execution_source='expert_replay' if args.replay_reference else 'model')
+    config['action_limits_rad_s'] = action_limits.tolist()
+    config['action_limit_profile'] = info.get('action_limit_profile', 'excavator_velocity_v1')
+    config['replay_scope'] = 'full_reference' if args.replay_full_reference else 'single_cycle'
+    if args.act_carry_guard:
+        config.update(supervisor=True, execution_source='model_with_carry_guard',
+                      carry_guard_settings=carry_guard_settings(args.act_carry_parent_projection,
+                                                               args.act_carry_release_geometry,
+                                                               args.act_carry_max_pitch_deg,
+                                                               args.act_carry_near_bed_relax_m,
+                                                               args.act_carry_opening_near_edge_m,
+                                                              args.act_carry_opening_target_rad,
+                                                              args.act_carry_release_interlock))
+    if args.expert_prefix_steps:
+        config.update(supervisor=True, execution_source='expert_prefix_then_model_with_carry_guard'
+                      if args.act_carry_guard else 'expert_prefix_then_model')
     config.update(evaluation_standard=EVALUATION_STANDARD, truck_count_method=TRUCK_COUNT_METHOD,
                   evaluation_profile=execution_profile(args.fresh_simulator, args.render_every_physics_step,
                                                        args.headless, reference is not None))
@@ -227,6 +303,13 @@ def main():
                       scene_distribution='collection_sampler_and_first_cycle_planner',
                       dig_target_method='collection_first_cycle_plan',
                       unload_target_method='repeat_flat_fill_v2', initial_pose_method='collection_repeat_pile_facing')
+    if args.policy_type == 'pi05':
+        from lerobot.policies.pi05.configuration_pi05 import PI05Config  # register pi05
+        from excavator_vlm.policies.pi05.history import bind_history, history_spec
+        saved_config = PreTrainedConfig.from_pretrained(str(args.checkpoint))
+        checkpoint_manifest = json.loads((args.checkpoint / 'checkpoint.json').read_text())
+        config['observation_history'] = history_spec(bind_history(
+            saved_config, checkpoint_manifest.get('observation_history')))
     config['metric_definitions'] = METRIC_DEFINITIONS
     if args.reference_episode and args.reference_episode.is_file():
         config['reference_setup_sha256'] = hashlib.sha256(args.reference_episode.read_bytes()).hexdigest()
@@ -238,6 +321,24 @@ def main():
             'initial_joints_deg', 'bucket_open_threshold', 'completion_observations',
             'fresh_simulator', 'render_every_physics_step', 'headless', 'execution_source',
             'sand_initialization', 'dig_target_method', 'simulation_settings')}
+        protocol.update(act_temporal_window=args.act_temporal_window,
+                        act_temporal_decay=args.act_temporal_decay if args.act_temporal_window else None)
+        protocol.update(act_carry_guard=args.act_carry_guard,
+                        carry_guard_settings=carry_guard_settings(args.act_carry_parent_projection,
+                                                                 args.act_carry_release_geometry,
+                                                                 args.act_carry_max_pitch_deg,
+                                                                 args.act_carry_near_bed_relax_m,
+                                                                 args.act_carry_opening_near_edge_m,
+                                                                 args.act_carry_opening_target_rad,
+                                                                 args.act_carry_release_interlock)
+                        if args.act_carry_guard else None)
+        protocol['expert_prefix_steps'] = args.expert_prefix_steps
+        protocol.update(action_limits_rad_s=config['action_limits_rad_s'],
+                        action_limit_profile=config['action_limit_profile'])
+        protocol['replay_scope'] = config['replay_scope']
+        if 'observation_history' in config:
+            protocol['observation_history'] = config['observation_history']
+        protocol['post_rollout_observe_steps'] = args.post_rollout_observe_steps
         if 'reference_setup_sha256' in config:
             protocol['reference_setup_sha256'] = config['reference_setup_sha256']
         protocol.update({key: config[key] for key in ('unload_target_method', 'initial_pose_method')})
@@ -373,6 +474,8 @@ def run_episodes(args, info, reference, action_limits, policy,
         if digest != config['scene_manifest_sha256']:
             raise ValueError('Collection scene manifest changed after evaluation started')
     base_simulator_command = list(session.command)
+    temporal_window = getattr(args, 'act_temporal_window', 0)
+    temporal_decay = getattr(args, 'act_temporal_decay', .5)
     trajectory_store = None
     if args.save_trajectory:
         # Imported on demand so a simulator-only checkout can still evaluate.
@@ -398,6 +501,11 @@ def run_episodes(args, info, reference, action_limits, policy,
             'evaluation_standard', 'evaluation_profile', 'evaluation_id', 'checkpoint_sha256')})
         status.update(policy_type=getattr(args, 'policy_type', 'smolvla'),
                       clipped_action_dimensions=0, applied_action_dimensions=0)
+        status.update(act_temporal_window=temporal_window,
+                      act_temporal_decay=temporal_decay if temporal_window else None)
+        status.update(act_carry_guard=getattr(args, 'act_carry_guard', False), carry_guard_modified_steps=0)
+        prefix_steps = getattr(args, 'expert_prefix_steps', 0)
+        status.update(expert_prefix_steps=prefix_steps, expert_prefix_steps_executed=0)
         metrics = EpisodeMetrics()
         diagnostics = None
         progress_path = args.output / 'workers' / f'worker_{args.worker_index:02d}' / 'progress.json'
@@ -448,6 +556,14 @@ def run_episodes(args, info, reference, action_limits, policy,
                     raise ValueError('Simulator soil settings differ from the evaluation manifest')
                 diagnostics = RolloutDiagnostics(scene['canonical_joint_limits_rad'],
                                                  stall_window_steps=max(2, math.ceil(info['fps'] * 5)))
+                carry_guard = (CarryAttitudeGuard(scene, dt=1 / info['fps'], action_limits=action_limits,
+                    settings=CarryGuardSettings(max_carry_pitch_deg=args.act_carry_max_pitch_deg,
+                        parent_projection=getattr(args, 'act_carry_parent_projection', 'balanced'),
+                        release_geometry=getattr(args, 'act_carry_release_geometry', 'current'),
+                        near_bed_relax_distance_m=args.act_carry_near_bed_relax_m,
+                        opening_pose_near_edge_m=args.act_carry_opening_near_edge_m,
+                        opening_pose_target_bucket_rad=args.act_carry_opening_target_rad))
+                               if getattr(args, 'act_carry_guard', False) else None)
                 status['kit_pid'] = scene['simulator_pid']
                 contract = build_client_contract(info['fps'], normalization_hash,
                     OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT, scene['observation_context'])
@@ -488,6 +604,17 @@ def run_episodes(args, info, reference, action_limits, policy,
                                         'final_bucket_open': float(reply['joint_positions'][3]) >= -0.80})
                 if policy is not None:
                     policy.reset()
+                observation_history = None
+                if getattr(args, 'policy_type', 'smolvla') == 'pi05' and policy is not None:
+                    from excavator_vlm.policies.pi05.history import ObservationHistory, history_spec
+                    history_contract = history_spec(policy.config)
+                    status['observation_history'] = history_contract
+                    if history_contract['fps'] != info['fps']:
+                        raise ValueError('Checkpoint history cadence differs from the simulator')
+                    if policy.config.n_obs_steps > 1:
+                        observation_history = ObservationHistory(history_contract)
+                ensemble = (TemporalActionEnsemble(temporal_window, temporal_decay)
+                            if temporal_window else None)
                 actions = []
                 policy_start = time.monotonic()
                 report_progress('rollout', force=True)
@@ -496,20 +623,33 @@ def run_episodes(args, info, reference, action_limits, policy,
                     policy_latency_ms = None
                     # Validate every returned observation, including between replans.
                     state_pre = validate_state(reply)
+                    if observation_history is not None:
+                        observation_history.append(policy_batch(frames, state_pre, reply['task_text']), step)
                     input_state = state_pre.tolist()
+                    input_bucket_landmarks = reply.get('bucket_landmarks_world')
                     pre_action_camera_sha256 = frame_hashes(frames)
-                    if args.replay_reference:
+                    prefix_action = step < prefix_steps
+                    if args.replay_reference or prefix_action:
                         if step >= len(reference['actions']):
                             status['termination_reason'] = 'reference_finished'
                             break
                         actions = [reference['actions'][step]]
+                        if prefix_action:
+                            status['expert_prefix_steps_executed'] += 1
                     elif not actions:
                         inference_started = time.perf_counter()
                         batch = policy_batch(frames, state_pre, reply['task_text'])
+                        if observation_history is not None:
+                            batch = observation_history.batch()
                         with torch.inference_mode():
                             chunk = policy.predict_action_chunk(preprocess(batch))
-                            actions = [postprocess(chunk[:, i]).cpu().numpy()[0]
-                                       for i in range(min(args.replan_interval, chunk.shape[1]))]
+                            if ensemble is not None:
+                                physical = np.stack([postprocess(chunk[:, i]).cpu().numpy()[0]
+                                                     for i in range(chunk.shape[1])])
+                                actions = [ensemble.update(physical)]
+                            else:
+                                actions = [postprocess(chunk[:, i]).cpu().numpy()[0]
+                                           for i in range(min(args.replan_interval, chunk.shape[1]))]
                         # CPU action transfer above waits for CUDA completion.
                         policy_latency_ms = (time.perf_counter() - inference_started) * 1000
                         metrics.policy_ms.append(policy_latency_ms)
@@ -518,7 +658,13 @@ def run_episodes(args, info, reference, action_limits, policy,
                     if predicted.shape != (4,) or not np.isfinite(predicted).all():
                         raise ValueError('Invalid model action')
                     applied = np.clip(predicted, -action_limits, action_limits)
-                    status['clipped_action_dimensions'] += int(np.count_nonzero(applied != predicted))
+                    clipped_dimensions = int(np.count_nonzero(applied != predicted))
+                    carry_guard_trace = None
+                    if carry_guard is not None and not prefix_action:
+                        applied, carry_guard_trace = carry_guard.update(
+                            state_pre, applied, reply['joint_command_positions'], reply['bucket_landmarks_world'])
+                        status['carry_guard_modified_steps'] += int(carry_guard_trace['modified'])
+                    status['clipped_action_dimensions'] += clipped_dimensions
                     status['applied_action_dimensions'] += len(applied)
                     bridge_started = time.perf_counter()
                     reply = exchange(sock, {'joint_velocities': applied.tolist()})
@@ -553,6 +699,9 @@ def run_episodes(args, info, reference, action_limits, policy,
                     if success and 'success_time_from_policy_start_seconds' not in status:
                         status['success_time_from_policy_start_seconds'] = elapsed
                         status['success_time_from_simulation_launch_seconds'] = time.monotonic() - started
+                        if getattr(args, 'replay_full_reference', False):
+                            status['task_completion_time_from_policy_start_seconds'] = elapsed
+                            status['task_completion_time_from_simulation_launch_seconds'] = time.monotonic() - started
                     if store is not None:
                         store.add(step=step, frames=frames, frame_sha256=pre_action_camera_sha256,
                                   state_pre=state_pre, state_post=state_post,
@@ -560,7 +709,16 @@ def run_episodes(args, info, reference, action_limits, policy,
                                   particles=metrics.transfer, bucket_position=bucket_q,
                                   replanned=policy_latency_ms is not None)
                     trace.write(json.dumps({'step': step, 'predicted': predicted.tolist(), 'applied': applied.tolist(),
+                                            'action_source': 'expert_prefix' if prefix_action else config['execution_source'],
+                                            'carry_guard': carry_guard_trace,
+                                            'input_bucket_landmarks_world': input_bucket_landmarks,
                                             'input_state': input_state, 'state': reply['observation_state_28d'],
+                                            'input_history_steps': ([max(0, step + offset) for offset in
+                                                observation_history.spec['delta_indices']]
+                                                if observation_history is not None else None),
+                                            'input_history_is_pad': ([step + offset < 0 for offset in
+                                                observation_history.spec['delta_indices']]
+                                                if observation_history is not None else None),
                                             'joint_command_positions': reply['joint_command_positions'],
                                             'deposited_particles': count, 'stable_steps': stable_steps,
                                             'bucket_position': bucket_q, 'bridge_timing': reply['bridge_timing'],
@@ -577,19 +735,49 @@ def run_episodes(args, info, reference, action_limits, policy,
                         video.write(reply, {**status, 'status': 'running'}, stable_steps)
                     report_progress('rollout')
                     frames = post_action_frames
-                    if success and bucket_open:
+                    if success and bucket_open and not getattr(args, 'replay_full_reference', False):
                         status.update(early_terminated=True, termination_reason='success_and_bucket_open',
                                       task_completion_time_from_policy_start_seconds=elapsed,
                                       task_completion_time_from_simulation_launch_seconds=time.monotonic() - started)
                         break
                 status.update(status='completed', rollout_time_from_policy_start_seconds=time.monotonic() - policy_start,
                               rollout_time_from_simulation_launch_seconds=time.monotonic() - started)
+                if getattr(args, 'replay_full_reference', False):
+                    status.update(full_reference_executed=status['policy_steps_executed'] == len(reference['actions']),
+                                  success_scope='single_cycle_metric; use separate five-cycle replay gate')
+                    if status['full_reference_executed']:
+                        status['termination_reason'] = 'full_reference_finished'
                 status.setdefault('termination_reason', 'step_limit')
                 (folder / 'rollout_validation.json').write_text(json.dumps({
-                    'status': 'passed', 'pure_model_execution_validated': not args.replay_reference,
+                    'status': 'passed', 'pure_model_execution_validated': config['execution_source'] == 'model',
                     'execution_source': config['execution_source'],
-                    'supervisor_enabled': False, 'action_velocity_limits': action_limits.tolist(),
+                    'supervisor_enabled': bool(config.get('supervisor', False)),
+                    'action_velocity_limits': action_limits.tolist(),
                 }, indent=2))
+                if getattr(args, 'post_rollout_observe_steps', 0):
+                    tail_video = (EpisodeVideo(folder / 'post_rollout.mp4', index, status['scene_seed'],
+                        info['fps'], args.post_rollout_observe_steps, args.min_particles) if args.video else None)
+                    try:
+                        def tail_frame(observation, row):
+                            if tail_video is not None:
+                                tail_video.write(observation, {**status,
+                                    'policy_steps_executed': row['observation'],
+                                    'final_newly_deposited_particle_count':
+                                        row['particle_transfer_metrics']['payload_particles']})
+                        status['post_rollout_diagnostic'] = observe_after_rollout(folder, reply,
+                            lambda action: exchange(sock, action), args.post_rollout_observe_steps,
+                            status['scene_seed'], tail_frame)
+                        atomic_json(folder / 'post_rollout_summary.json', status['post_rollout_diagnostic'])
+                    except Exception as error:
+                        status['post_rollout_diagnostic'] = dict(status='error', error=str(error))
+                        atomic_json(folder / 'post_rollout_summary.json', status['post_rollout_diagnostic'])
+                    finally:
+                        if tail_video is not None:
+                            try:
+                                tail_video.finish(status)
+                            except Exception as error:
+                                status['post_rollout_diagnostic'] = dict(status='error', error=str(error))
+                                atomic_json(folder / 'post_rollout_summary.json', status['post_rollout_diagnostic'])
         except BaseException as exc:
             status.update(status='error', error=f'{type(exc).__name__}: {exc}')
             failed = True

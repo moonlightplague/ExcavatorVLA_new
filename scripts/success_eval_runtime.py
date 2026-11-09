@@ -34,8 +34,13 @@ def evaluation_provenance(base, checkpoint, dataset, protocol, software):
                *[base / 'scripts' / name for name in (
                    'eval_smolvla_success.py', 'success_eval_runtime.py', 'eval_video.py',
                    'excavator_diagnostics.py', 'success_eval_diagnostics.py',
+                   'act_temporal_ensemble.py', 'act_carry_guard.py', 'spillage_diagnostics.py',
                    'collection_eval_scenes.py')],
                base / 'ExcavatorVLA-isaac/assets/usd/excavator_scene.usd', base / 'run_isaac_python.sh']
+    if protocol.get('policy_type') == 'pi05':
+        sources.extend((base / 'ExcavatorVLA-vlm/excavator_vlm/policies/pi05').glob('*.py'))
+        sources.extend((base / 'ExcavatorVLA-vlm/excavator_vlm/common').glob('*.py'))
+        sources.extend((base / 'ExcavatorVLA-vlm/excavator_vlm/data').glob('*.py'))
     if protocol.get('scene_manifest_sha256'):
         sources.extend((base / 'baseline').glob('*.py'))
         sources.extend((base / 'ExcavatorVLA-isaac/scripts/excavator_app').glob('*.py'))

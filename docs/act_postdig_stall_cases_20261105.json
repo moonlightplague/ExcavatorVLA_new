@@ -1,0 +1,20 @@
+{
+  "baseline_id": "act_phw40k_carry275_20261105",
+  "source": "user_review_of_original_40_videos",
+  "priority": "first",
+  "label": "postdig_stall",
+  "scenes": [
+    1,
+    2,
+    4,
+    9,
+    10,
+    15,
+    18,
+    24,
+    29,
+    31
+  ],
+  "source_experiment": "outputs/experiments/act_transport_validation40_20261104_01",
+  "scope": "User problem classification, not action supervision or proof of transport readiness"
+}

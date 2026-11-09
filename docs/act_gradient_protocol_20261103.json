@@ -1,0 +1,185 @@
+{
+  "schema_version": "act_gradient_experiment_plan_v1",
+  "status": "diagnosis_completed_gate_failed",
+  "hypothesis": "Hold-stage supervision gradients may conflict with other-stage supervision in shared ACT parameters; diagnosis is required before enabling the update experiment.",
+  "source_checkpoint": "outputs/train/excavator_act_phw_20261028_150222_336724_1423224/checkpoints/040000/pretrained_model",
+  "source_model_sha256": "665554b8c4b48533f0606c5506e5ea8f12558ab76912beb80191043ae1c60924",
+  "diagnosis": {
+    "train_hold_observations": 215,
+    "neighbor_candidate_stages": [
+      5,
+      6,
+      7
+    ],
+    "neighbors_per_partition": 5,
+    "neighbor_partitions": [
+      "same_episode",
+      "different_episode"
+    ],
+    "max_image_pairs": 8,
+    "batch_size": 16,
+    "sampling_seed": 1000,
+    "max_batches_inspected_for_selection": 64,
+    "selected_batches": 16,
+    "forward_seeds": [
+      1000,
+      1001
+    ],
+    "max_gradient_forwards": 32,
+    "optimizer_updates": 0,
+    "activation_gate": {
+      "compare": "hold_l1_vs_other_l1_excluding_kl",
+      "gradient_scope": "all_trainable_parameters_as_one_vector",
+      "cosine_below": -0.1,
+      "minimum_gradient_norm": 1e-10,
+      "minimum_conflicting_batches_per_forward_seed": 8,
+      "minimum_projection_trigger_batches_per_forward_seed_including_kl": 4,
+      "interpretation": "predeclared experimental screening rule, not proof of cause"
+    }
+  },
+  "paired_training": {
+    "arms": [
+      "focused_plain_update",
+      "focused_projected_hold_update"
+    ],
+    "only_intervention": "gradient_composition",
+    "steps_per_arm": 400,
+    "first_seed": 1000,
+    "replication_seed_if_first_pair_passes": 1001,
+    "maximum_total_optimizer_updates": 1600,
+    "batch_size": 16,
+    "learning_rate": 1e-05,
+    "weight_decay": 0.0001,
+    "gradient_clip_norm": 10,
+    "kl_weight": 10,
+    "dropout": 0.1,
+    "precision": "bf16",
+    "optimizer": "fresh_original_AdamW_preset",
+    "chunk_size": 10,
+    "n_action_steps": 3,
+    "sampling": {
+      "uniform_probability": 0.7,
+      "episode_balanced_stage5_6_probability": 0.3,
+      "candidate_manifest": "outputs/experiments/act_incremental_sampling_20261103_01/focused_observations.json",
+      "same_draws_for_both_arms": true
+    },
+    "hold_partition": "future_valid_action_target_stage_6",
+    "shared_l1_denominator": "4 * sum(valid * original_PHW_weight)",
+    "protected_gradient": "grad(other_stage_l1 + 10 * original_KL)",
+    "minimum_protected_gradient_squared_norm_for_projection": 1e-20,
+    "gradient_parameter_scope": "all_trainable_parameters_as_one_vector",
+    "validation_steps": [
+      0,
+      100,
+      200,
+      400
+    ],
+    "selected_checkpoint_step": 400,
+    "normalization": "original_saved_processors",
+    "phase_labels_as_policy_input": false
+  },
+  "offline_screen": {
+    "manifest": "outputs/experiments/act_incremental_sampling_20261103_01/offline_observations.json",
+    "observations": 1048,
+    "validation_hold_frames": 22,
+    "minimum_hold_bucket_first_mae_reduction_vs_original": 0.2,
+    "minimum_hold_bucket_first_mae_reduction_vs_control": 0.1,
+    "apply_same_reductions_to_moving_subset": true,
+    "moving_bucket_target_abs_above_rad_s": 0.1,
+    "max_exit_bucket_first_mae_increase_vs_both_references": 0.05,
+    "protected_first_three_stages": [
+      4,
+      7,
+      8,
+      9
+    ],
+    "max_protected_first_three_mae_increase_vs_both_references": 0.05,
+    "max_unload_chunk_mae_increase_vs_both_references": 0.1,
+    "full_validation_after_replication_passes": true,
+    "max_other_stage_full_validation_first_three_mae_increase_vs_both_references": 0.1,
+    "test_used": false,
+    "independent_test_claim": false
+  },
+  "closed_loop": {
+    "enabled_only_after_all_prior_gates_pass": true,
+    "candidate_training_seed": 1000,
+    "candidate_checkpoint_step": 400,
+    "reference_setup": "outputs/experiments/act_phw_optimization_20261103_01/reference_setup.json",
+    "cases": [
+      {
+        "id": "recorded_episode1_reference",
+        "scene_type": "recorded_reference",
+        "previous_model_trace": "outputs/experiments/act_phw_diagnostics_20261102_01/reference_replan3/episodes/episode_0001"
+      },
+      {
+        "id": "debug_seed3_stall",
+        "scene_type": "random_development",
+        "scene_seed": 3,
+        "previous_model_trace": "outputs/experiments/act_phw_diagnostics_20261102_01/debug_replan3/episodes/episode_0002"
+      },
+      {
+        "id": "debug_seed4_success_guard",
+        "scene_type": "random_development",
+        "scene_seed": 4,
+        "previous_model_trace": "outputs/experiments/act_phw_diagnostics_20261102_01/debug_replan3/episodes/episode_0003"
+      }
+    ],
+    "policies": [
+      "original_phw40k",
+      "plain_seed1000_step400",
+      "projected_seed1000_step400"
+    ],
+    "maximum_model_episodes": 9,
+    "maximum_expert_replays": 1,
+    "physics": "physx_move_walls_before_settling",
+    "fps": 10,
+    "max_steps": 350,
+    "n_action_steps": 3,
+    "min_deposited_source_particles": 100,
+    "required_consecutive_open_steps": 3,
+    "fresh_simulator_per_case": true,
+    "render_every_physics_step": true,
+    "minimum_seed3_stall_steps_reduction_vs_rerun_original": 0.5,
+    "require_actual_loaded_exit_and_transport": true,
+    "require_seed4_success_preserved": true,
+    "empty_bucket_stall_reduction_is_improvement": false,
+    "independent_test_claim": false
+  },
+  "planned_output": "outputs/experiments/act_gradient_projection_20261103_01",
+  "failure_policy": "Stop at the failed gate and record evidence; no automatic budget extension or extra search.",
+  "pinned_inputs_sha256": {
+    "outputs/experiments/act_phw_optimization_20261103_01/reference_setup.json": "03924ff03e7997f6f6e4611b2f924385da24aec8b7f76bbb9b89510950b3ebab",
+    "outputs/experiments/act_incremental_sampling_20261103_01/offline_observations.json": "7753dd1fd57a0cfa9fd7c23f01cf204e0f04b0f5ba978c4ec6cb3933372bc715",
+    "outputs/experiments/act_incremental_sampling_20261103_01/focused_observations.json": "b6d1f995e82fccf988df024b14f0e4ecc010646d59ebc7e1b568fda067b89c38",
+    "outputs/train/excavator_act_phw_20261028_150222_336724_1423224/checkpoints/040000/pretrained_model/benchmark_provenance.json": "2b823835a4bdc4e2cfe6cc6014e8f22582f920fdaf4f3df40b9657029d7200fc",
+    "outputs/train/excavator_act_phw_20261028_150222_336724_1423224/checkpoints/040000/pretrained_model/policy_postprocessor.json": "0e1790afcabc4ab149c95f833f8068f8470f6fa923e87734284e63d4d5eb0ee5",
+    "outputs/train/excavator_act_phw_20261028_150222_336724_1423224/checkpoints/040000/pretrained_model/policy_preprocessor_step_3_normalizer_processor.safetensors": "591971a5fb0a9687a5ecb4371d059d066488ae93c0604ad4eb1e6e4f51655e23",
+    "outputs/train/excavator_act_phw_20261028_150222_336724_1423224/checkpoints/040000/pretrained_model/policy_preprocessor.json": "08ec31567d7f7f468850d533e5648d2e3b2ad3365b7a6a7633d2ea02373b1c8a",
+    "outputs/train/excavator_act_phw_20261028_150222_336724_1423224/checkpoints/040000/pretrained_model/policy_postprocessor_step_0_unnormalizer_processor.safetensors": "591971a5fb0a9687a5ecb4371d059d066488ae93c0604ad4eb1e6e4f51655e23"
+  },
+  "execution_result": {
+    "path": "outputs/experiments/act_gradient_projection_20261103_01/diagnosis_result.json",
+    "activation_gate_passed": false,
+    "seed_results": [
+      {
+        "forward_seed": 1000,
+        "batches": 16,
+        "conflicting_batches": 8,
+        "projection_trigger_batches": 10,
+        "passed": true
+      },
+      {
+        "forward_seed": 1001,
+        "batches": 16,
+        "conflicting_batches": 6,
+        "projection_trigger_batches": 9,
+        "passed": false
+      }
+    ],
+    "gradient_forwards": 32,
+    "optimizer_updates": 0,
+    "training_started": false,
+    "closed_loop_started": false,
+    "preregistered_protocol_copy": "outputs/experiments/act_gradient_projection_20261103_01/protocol.json"
+  }
+}

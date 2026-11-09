@@ -28,6 +28,7 @@ from excavator_common.evaluation_standard import (
 )
 from success_eval_runtime import atomic_json, episode_indices
 from success_eval_diagnostics import RolloutDiagnostics
+from act_temporal_ensemble import TemporalActionEnsemble
 from excavator_common.simulation_settings import resolve_simulation_settings
 from summarize_isaacsim_success_rate import build_summary, load_episode_rows, write_outputs
 
@@ -230,7 +231,7 @@ class SimulatorParticleIndicesTests(unittest.TestCase):
 
 
 class RolloutIntegrationTests(unittest.TestCase):
-    def run_rollout(self, directory, *, video=True, steps=8, replay=False, fail=False, video_error=False, episodes=1, interrupt=False):
+    def run_rollout(self, directory, *, video=True, steps=8, replay=False, fail=False, video_error=False, episodes=1, interrupt=False, temporal=False, prefix=0, history=False, full_replay=False):
         simulation_settings = resolve_simulation_settings(environ={})
         clock = SimpleNamespace(now=0.)
         clock.monotonic = clock.perf_counter = lambda: clock.now
@@ -252,7 +253,6 @@ class RolloutIntegrationTests(unittest.TestCase):
 
         policy.predict_action_chunk.side_effect = infer
         session = Mock(log_path=Path(directory) / 'simulator.log')
-        session.command = []
         (Path(directory) / 'workers' / 'worker_00').mkdir(parents=True)
         sequences = []
 
@@ -300,6 +300,7 @@ class RolloutIntegrationTests(unittest.TestCase):
             torch=SimpleNamespace(manual_seed=lambda seed: None, inference_mode=nullcontext),
             EpisodeVideo=Video, EpisodeMetrics=EpisodeMetrics, failure_mode=failure_mode,
             RolloutDiagnostics=RolloutDiagnostics,
+            TemporalActionEnsemble=TemporalActionEnsemble,
             CompletionTracker=CompletionTracker, BUCKET_OPEN_RAD=BUCKET_OPEN_RAD,
             episode_indices=episode_indices, atomic_json=atomic_json, exchange=exchange,
             STATE_NAMES_28D=tuple(range(28)), OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT='v4',
@@ -310,15 +311,36 @@ class RolloutIntegrationTests(unittest.TestCase):
             validate_scene_metric=lambda *args: None, random=Mock(),
         )
         extract_functions(BASE / 'scripts/eval_smolvla_success.py', {'run_episodes'}, namespace)
+        if history:
+            import torch as real_torch
+            sys.path.insert(0, str(BASE / 'ExcavatorVLA-vlm'))
+            from excavator_vlm.policies.pi05.history import make_history
+            policy.config = SimpleNamespace(n_obs_steps=3,
+                excavator_observation_history=make_history([-6, -3, 0]))
+            namespace['policy_batch'] = lambda *args: {
+                'observation.state': real_torch.zeros(1, 28), 'task': ['Excavate.'],
+                **{f'observation.images.{i}': real_torch.zeros(1, 3, 256, 256) for i in range(3)}}
         args = SimpleNamespace(episodes=episodes, worker_index=0, worker_count=1, output=Path(directory),
                                gpu_label='test', seed=2, video=video, steps=steps, min_particles=2,
-                               replay_reference=replay, replan_interval=3, fresh_simulator=False,
+                               replay_reference=replay, replan_interval=1 if temporal else 3, fresh_simulator=False,
+                               act_temporal_window=3 if temporal else 0, act_temporal_decay=.5,
+                               expert_prefix_steps=prefix,
+                               replay_full_reference=full_replay,
                                save_trajectory=False, progress_interval=15.)
+        if history:
+            args.policy_type = 'pi05'
         reference = {'actions': [np.zeros(4)] * 2, 'expected_initial_state': np.zeros(28)} if replay else None
+        if full_replay:
+            reference['actions'] = [np.zeros(4)] * steps
+        if prefix:
+            reference = {'actions': [np.full(4, .25)] * (prefix+1), 'expected_initial_state': np.zeros(28)}
         config = {'execution_source': 'expert_replay' if replay else 'model',
                   'evaluation_standard': EVALUATION_STANDARD, 'evaluation_profile': 'diagnostic',
                   'evaluation_id': 'fixture', 'checkpoint_sha256': 'fixture-checkpoint',
                   'simulation_settings': simulation_settings}
+        if prefix:
+            config['execution_source'] = 'expert_prefix_then_model'
+        session.command = []
         call = lambda: namespace['run_episodes'](args, {'fps': 10}, reference, np.ones(4),
                     None if replay else policy, lambda value: value, lambda value: value, '', config, session)
         if fail or video_error or interrupt:
@@ -327,6 +349,49 @@ class RolloutIntegrationTests(unittest.TestCase):
         else:
             call()
         return load_episode_rows(Path(directory) / 'episodes'), policy
+
+    def test_full_reference_does_not_stop_at_first_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows, _ = self.run_rollout(directory, replay=True, full_replay=True, video=False)
+            status = json.loads((Path(directory) / 'episodes/episode_0001/episode_status.json').read_text())
+            self.assertTrue(status['full_reference_executed'])
+            self.assertFalse(status['early_terminated'])
+            self.assertEqual(status['policy_steps_executed'], 8)
+            self.assertEqual(status['termination_reason'], 'full_reference_finished')
+
+    def test_pi05_history_updates_between_replans_and_resets_per_episode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows, policy = self.run_rollout(directory, episodes=2, history=True, video=False)
+            self.assertTrue(all(row['success'] for row in rows))
+            calls = policy.predict_action_chunk.call_args_list
+            self.assertEqual([call.args[0]['history_is_pad'].tolist() for call in calls],
+                             [[[True, True, False]], [[True, False, False]]] * 2)
+            trace = [json.loads(line) for line in
+                     (Path(directory) / 'episodes/episode_0001/steps.jsonl').read_text().splitlines()]
+            self.assertEqual(trace[3]['input_history_steps'], [0, 0, 3])
+            self.assertEqual(trace[3]['input_history_is_pad'], [True, False, False])
+
+    def test_temporal_rollouts_replan_each_step_and_preserve_completion_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows, policy = self.run_rollout(directory, episodes=2, temporal=True)
+            self.assertTrue(all(row['success'] for row in rows))
+            self.assertEqual(policy.predict_action_chunk.call_count,
+                             sum(row['policy_steps_executed'] for row in rows))
+            self.assertEqual(policy.reset.call_count, 2)
+
+    def test_expert_prefix_is_separate_from_model_actions_and_takeover_replans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows, policy = self.run_rollout(directory, prefix=2, video=False)
+            self.assertTrue(rows[0]['success'])
+            self.assertEqual(policy.predict_action_chunk.call_count, 1)
+            folder = Path(directory) / 'episodes/episode_0001'
+            status = json.loads((folder/'episode_status.json').read_text())
+            self.assertEqual(status['expert_prefix_steps_executed'], 2)
+            trace = [json.loads(line) for line in (folder/'steps.jsonl').read_text().splitlines()]
+            self.assertEqual([row['action_source'] for row in trace[:2]], ['expert_prefix']*2)
+            self.assertEqual(trace[2]['action_source'], 'expert_prefix_then_model')
+            np.testing.assert_array_equal(trace[0]['predicted'], [.25]*4)
+            np.testing.assert_array_equal(trace[2]['predicted'], [0.]*4)
 
     def test_success_persists_all_metrics_and_excludes_final_video_hold(self):
         with tempfile.TemporaryDirectory() as directory:

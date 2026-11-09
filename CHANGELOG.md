@@ -1,7 +1,14 @@
 # Changelog
 
+## 2026-11-09 — PI05 repeated-data repair experiment
+
+- Record experimental action-limit profiles in evaluation provenance and reject silent model/profile mismatches.
+- Add explicit full-reference expert replay without first-scoop early termination; keep ordinary model and single-cycle evaluation unchanged.
+- Prepare the versioned PI05 bucket20 repeated-data candidate and gated dual-GPU C training at 20k updates with 2k checkpoint retention; actual gate/training outcomes remain in ignored experiment outputs.
+
 ## 2026-11-08 — PI05 PhysX training and evaluation
 
+- Maintain episode-local image/state windows for PI05 scheme C during chunk execution and record the history contract/window indices in evaluation provenance and traces.
 - Update the VLM submodule with verified-backend single-cycle PI05 training, continuation, and checkpoint-comparison tools.
 - Support source-recorded reference setups and collection-prepared scene manifests in the shared evaluator, including per-scene initial poses, targets, and provenance hashes.
 - Add the collection-matched multi-GPU evaluation runner, scene validation, regression coverage, and protocol documentation; update the baseline scene-preparation dependency.

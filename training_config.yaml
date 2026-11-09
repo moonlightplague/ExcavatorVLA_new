@@ -1,7 +1,7 @@
 # Paths are relative to this YAML file. This is a full training run, not a smoke test.
 dataset:
   repo_id: local/excavator
-  root: data/export
+  root: data/repeat/export_repeat
   episodes: null                 # Set a list of episode IDs to select training data.
   video_backend: pyav
   image_transforms:
@@ -27,11 +27,11 @@ policy:
   scheduler_decay_steps: 20000
   scheduler_decay_lr: 0.0000025
 
-steps: 40000
+steps: 80000
 batch_size: 16                   # Per GPU; two GPUs with batch_size=8 means batch 16.
 num_workers: 8                  # Data-loading workers per training process.
 seed: 1000
-save_freq: 10000
+save_freq: 20000
 log_freq: 200
 eval_freq: 0                    # Isaac success evaluation is run separately.
 save_checkpoint: true
@@ -43,7 +43,7 @@ wandb:
   project: excavator-smolvla
 
 launcher:
-  output_root: outputs/train
+  output_root: outputs/train/repeat
   hf_home: models/hf-cache
   gpu_ids: [0, 1]                  # Use [0, 1] for distributed training on both GPUs.
   mixed_precision: bf16         # no, fp16, or bf16; controlled through Accelerate.
