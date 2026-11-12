@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-12 — Repository artifact maintenance
+
+- Maintain generated-artifact ignore rules in the root and all four submodules, including local tooling state, renderer caches, experiment tracking and coverage reports.
+- Unstage and ignore 1,971 generated coarse MPM experiment files (888 MiB), preserving local results, Python probes and required texture inputs.
+- Reclaim 6.01 GiB by removing regenerated caches and the superseded 20k/40k/60k repeated SmolVLA checkpoints; retain the complete final 80k checkpoint and its `last` link.
+- Audit `data/`, `models/` and `outputs/`; preserve datasets, base weights, recorded research evidence and PI05 milestone checkpoints explicitly retained by the comparison configurations.
+- Update all four submodule pins with maintenance-only commits and preserve pending application/evaluation changes separately.
+- Validate with 155 CPU regression tests covering collection/export, training, deployment and evaluation contracts.
+
 ## 2026-11-09 — Newton ten-cycle repeat tuning
 
 - Add reachable side-loading and source-ID episode acceptance options to the repeat baseline, with a fixed-attempt acceptance benchmark and retained strict counterfactual decisions.

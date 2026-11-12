@@ -34,3 +34,10 @@ htmlcov/
 
 # Standalone generated evaluation media
 /output.mp4
+
+# Experiment tracking and machine-local runtime caches
+/.codex/
+.mpm_warp_cache/
+.shader-cache/
+/wandb/
+/tensorboard/
