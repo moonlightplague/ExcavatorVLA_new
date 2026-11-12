@@ -41,6 +41,8 @@ def evaluation_provenance(base, checkpoint, dataset, protocol, software):
         sources.extend((base / 'ExcavatorVLA-vlm/excavator_vlm/policies/pi05').glob('*.py'))
         sources.extend((base / 'ExcavatorVLA-vlm/excavator_vlm/common').glob('*.py'))
         sources.extend((base / 'ExcavatorVLA-vlm/excavator_vlm/data').glob('*.py'))
+    if protocol.get('repeat_spec'):
+        sources.append(base / 'scripts/repeat_eval.py')
     if protocol.get('scene_manifest_sha256'):
         sources.extend((base / 'baseline').glob('*.py'))
         sources.extend((base / 'ExcavatorVLA-isaac/scripts/excavator_app').glob('*.py'))

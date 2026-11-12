@@ -9,6 +9,14 @@
 - Update all four submodule pins with maintenance-only commits and preserve pending application/evaluation changes separately.
 - Validate with 155 CPU regression tests covering collection/export, training, deployment and evaluation contracts.
 
+## 2026-11-11 — Five-cycle model evaluation
+
+- Add opt-in, revision-checked goal updates without physics ticks, controller resets, new particle baselines or camera changes; keep legacy bridge clients immutable.
+- Evaluate five model-controlled scoop/dump/physical-return cycles using recorded per-cycle task coordinates, per-cycle source-ID accounting, persistent C history and an independent trace/goal-transition audit.
+- Distinguish archived collection thresholds from the separate 100-particle-per-cycle strict result; label recorded-goal evaluations as diagnostics, not live fill-planner generalization.
+- Run disjoint checkpoint/video queues on both GPUs with live combined summaries, preserve cancelled single-cycle outputs, and cover the new path with synthetic end-to-end and real PhysX bridge regressions.
+- Resume the ten-checkpoint five-cycle comparison after 29 focused tests and the live PhysX goal-update probe pass; display collection and strict thresholds/outcomes throughout evaluation videos and record the protocol in `docs/pi05_five_cycle_evaluation_20261111.md`.
+
 ## 2026-11-09 — Newton ten-cycle repeat tuning
 
 - Add reachable side-loading and source-ID episode acceptance options to the repeat baseline, with a fixed-attempt acceptance benchmark and retained strict counterfactual decisions.

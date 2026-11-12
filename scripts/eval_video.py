@@ -45,18 +45,36 @@ class EpisodeVideo:
         steps = int(status.get('policy_steps_executed', 0))
         count = int(status.get('final_newly_deposited_particle_count', 0))
         bucket = 'OPEN' if status.get('final_bucket_open') else 'CLOSED'
-        draw.text((12, 774), f'Episode {self.episode}  |  Seed {self.seed}  |  '
+        checkpoint = f"CKPT {status['checkpoint_step']}  |  " if status.get('checkpoint_step') else ''
+        draw.text((12, 774), checkpoint + f'Episode {self.episode}  |  Seed {self.seed}  |  '
                   f'Step {steps}/{self.max_steps}  |  Policy time {steps / self.fps:.1f}s',
                   font=self.font, fill='white')
-        draw.text((12, 802), f'Deposited {count}/{self.min_particles} particles  |  '
-                  f'Completion observations {self.stable_steps}/3  |  Bucket {bucket}', font=self.font, fill='white')
+        if status.get('repeat_cycles_target'):
+            line = (f"Cycles {status.get('repeat_cycles_completed', 0)}/{status['repeat_cycles_target']}  |  "
+                    f"{status.get('repeat_phase', '')}  |  "
+                    f"Load {status.get('repeat_cycle_payload_particles', 0)}  |  "
+                    f"Collection >= {status['repeat_min_payload_particles']}, "
+                    f"strict >= {status['repeat_strict_min_payload_particles']}/cycle")
+        else:
+            line = (f'Deposited {count}/{self.min_particles} particles  |  '
+                    f'Completion observations {self.stable_steps}/3  |  Bucket {bucket}')
+        draw.text((12, 802), line, font=self.font, fill='white')
         if not final:
             result, color = 'RUNNING', (100, 190, 255)
         elif status.get('error') or status.get('status') == 'error':
             result, color = f"ERROR: {status.get('error') or 'Evaluation failed'}", (255, 130, 100)
+        elif status.get('repeat_cycles_target'):
+            collection = 'YES' if status.get('repeat_collection_success') else 'NO'
+            strict = 'YES' if status.get('repeat_strict_success') else 'NO'
+            result = (f"Collection: {collection}  |  Strict: {strict}  |  "
+                      f"Returns {status.get('repeat_returns_completed', 0)}/{status['repeat_cycles_target']}")
+            if not status.get('repeat_collection_success'):
+                result += f"  |  {status.get('repeat_failure_mode', 'incomplete_repeated_task')}"
+            color = (90, 225, 130) if status.get('repeat_strict_success') else (255, 190, 90)
         elif status.get('success'):
             complete = 'YES' if status.get('task_completed_success_and_bucket_open') else 'NO'
-            result, color = f'SUCCESS  |  Task complete: {complete}', (90, 225, 130)
+            result = f'SUCCESS  |  Task complete: {complete}'
+            color = (90, 225, 130)
         else:
             result, color = f"FAILURE  |  {status.get('termination_reason', 'step_limit')}", (255, 190, 90)
         # Preserve the full error in the status JSON; fit its opening on screen.

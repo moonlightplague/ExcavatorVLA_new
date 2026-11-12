@@ -46,6 +46,7 @@ from act_temporal_ensemble import TemporalActionEnsemble
 from act_carry_guard import CarryAttitudeGuard, CarryGuardSettings, settings_dict as carry_guard_settings
 from spillage_diagnostics import observe_after_rollout
 from collection_eval_scenes import load_scene_manifest, simulator_command as collection_scene_command
+from repeat_eval import RepeatedTask, load_repeat_spec, verify_goal_ack, audit_repeat_trace, STANDARD as REPEAT_STANDARD
 
 CAMERA_IDS = ('0', '1', '2')
 
@@ -125,6 +126,10 @@ def main():
     parser.add_argument('--min-particles', type=int, default=100)
     parser.add_argument('--seed', type=int, default=2)
     parser.add_argument('--replan-interval', type=int, default=3)
+    parser.add_argument('--repeat-cycles', type=int, choices=(0, 5), default=0,
+                        help='Five-cycle recorded-goal diagnostic; every motion remains model-controlled')
+    parser.add_argument('--repeat-cycle-steps', type=int, default=500,
+                        help='Maximum executed actions per cycle, including its physical return')
     parser.add_argument('--act-temporal-window', type=int, default=0,
                         help='ACT only: blend this many recent overlapping chunks at each action; '
                              '0 retains ordinary chunk execution. Requires --replan-interval 1.')
@@ -251,6 +256,15 @@ def main():
         parser.error('Expert prefix requires a reference scene, a shorter positive prefix, and model takeover')
     if args.scene_manifest and (reference or args.replay_reference or not args.fresh_simulator):
         parser.error('--scene-manifest requires fresh simulators and cannot be mixed with reference replay')
+    repeat_spec = None
+    if args.repeat_cycles:
+        if (args.policy_type != 'pi05' or not args.reference_episode or not args.reference_episode.is_file()
+                or args.replay_reference or args.expert_prefix_steps or args.act_carry_guard or args.scene_manifest
+                or args.repeat_cycle_steps < 1 or args.steps < args.repeat_cycles * args.repeat_cycle_steps):
+            parser.error('Repeated evaluation requires a PI05 model, recorded reference, no expert/guard, '
+                         'and a total budget covering five positive cycle budgets')
+        repeat_spec = load_repeat_spec(args.dataset, args.reference_episode, args.repeat_cycles,
+                                       args.repeat_cycle_steps, args.min_particles)
     scene_manifest_hash = None
     if args.scene_manifest:
         args.scene_manifest = args.scene_manifest.resolve()
@@ -298,6 +312,10 @@ def main():
                   dig_target_method='cli_recorded_dig_target' if reference else TARGET_METHOD)
     config.update(unload_target_method='reference_recorded' if reference else 'truck_bed_center',
                   initial_pose_method='reference_recorded' if reference else 'fixed_dataset_episode')
+    if repeat_spec is not None:
+        config.update(repeat_spec=repeat_spec, evaluation_standard=REPEAT_STANDARD,
+                      replay_scope='five_cycle_model', evaluation_profile='diagnostic',
+                      dig_target_method='recorded_per_cycle_task_goal', unload_target_method='recorded_per_cycle_task_goal')
     if args.scene_manifest:
         config.update(scene_manifest_sha256=scene_manifest_hash,
                       scene_distribution='collection_sampler_and_first_cycle_planner',
@@ -308,6 +326,7 @@ def main():
         from excavator_vlm.policies.pi05.history import bind_history, history_spec
         saved_config = PreTrainedConfig.from_pretrained(str(args.checkpoint))
         checkpoint_manifest = json.loads((args.checkpoint / 'checkpoint.json').read_text())
+        config['checkpoint_step'] = checkpoint_manifest['step']
         config['observation_history'] = history_spec(bind_history(
             saved_config, checkpoint_manifest.get('observation_history')))
     config['metric_definitions'] = METRIC_DEFINITIONS
@@ -336,6 +355,8 @@ def main():
         protocol.update(action_limits_rad_s=config['action_limits_rad_s'],
                         action_limit_profile=config['action_limit_profile'])
         protocol['replay_scope'] = config['replay_scope']
+        if repeat_spec is not None:
+            protocol['repeat_spec'] = repeat_spec
         if 'observation_history' in config:
             protocol['observation_history'] = config['observation_history']
         protocol['post_rollout_observe_steps'] = args.post_rollout_observe_steps
@@ -500,6 +521,7 @@ def run_episodes(args, info, reference, action_limits, policy,
         status.update({key: config[key] for key in (
             'evaluation_standard', 'evaluation_profile', 'evaluation_id', 'checkpoint_sha256')})
         status.update(policy_type=getattr(args, 'policy_type', 'smolvla'),
+                      checkpoint_step=config.get('checkpoint_step'),
                       clipped_action_dimensions=0, applied_action_dimensions=0)
         status.update(act_temporal_window=temporal_window,
                       act_temporal_decay=temporal_decay if temporal_window else None)
@@ -507,6 +529,13 @@ def run_episodes(args, info, reference, action_limits, policy,
         prefix_steps = getattr(args, 'expert_prefix_steps', 0)
         status.update(expert_prefix_steps=prefix_steps, expert_prefix_steps_executed=0)
         metrics = EpisodeMetrics()
+        repeated = None
+        repeat_spec = config.get('repeat_spec')
+        if repeat_spec is not None:
+            status.update(repeat_cycles_target=repeat_spec['cycles'], repeat_cycles_completed=0,
+                          repeat_returns_completed=0, repeat_phase='starting',
+                          repeat_min_payload_particles=repeat_spec['min_payload_particles'],
+                          repeat_strict_min_payload_particles=repeat_spec['strict_min_payload_particles'])
         diagnostics = None
         progress_path = args.output / 'workers' / f'worker_{args.worker_index:02d}' / 'progress.json'
         last_progress = 0.
@@ -522,6 +551,9 @@ def run_episodes(args, info, reference, action_limits, policy,
                 'payload_particles': metrics.transfer.get('payload_particles', 0),
                 'retained_particles': metrics.transfer.get('retained_particles', 0),
                 'warnings': diagnostics.warnings() if diagnostics is not None else [],
+                'repeat_cycles_completed': status.get('repeat_cycles_completed'),
+                'repeat_cycle_index': status.get('repeat_cycle_index'),
+                'repeat_phase': status.get('repeat_phase'),
             })
             last_progress = now
         policy_start = None
@@ -565,8 +597,11 @@ def run_episodes(args, info, reference, action_limits, policy,
                         opening_pose_target_bucket_rad=args.act_carry_opening_target_rad))
                                if getattr(args, 'act_carry_guard', False) else None)
                 status['kit_pid'] = scene['simulator_pid']
+                observation_context = dict(scene['observation_context'])
+                if repeat_spec is not None:
+                    observation_context.update(allow_task_goal_updates=True, goal_revision=0)
                 contract = build_client_contract(info['fps'], normalization_hash,
-                    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT, scene['observation_context'])
+                    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT, observation_context)
                 ack = exchange(sock, contract)
                 if (ack.get('type') != 'handshake_ack' or ack.get('timing_mode') != 'deterministic_lockstep'
                         or ack.get('state_names') != list(STATE_NAMES_28D)
@@ -581,6 +616,9 @@ def run_episodes(args, info, reference, action_limits, policy,
                 initial_report = {'state': initial_state.tolist(), 'task': reply['task_text'],
                                   'camera_sha256': frame_hashes(frames),
                                   'truck_bed_load_metrics': reply['truck_bed_load_metrics']}
+                if repeat_spec is not None:
+                    initial_report.update(evaluation_particle_ids=reply['evaluation_particle_ids'],
+                                          observation_context=reply['observation_context'])
                 if prepared_scene is not None:
                     error = initial_state[:4] - np.radians(prepared_scene['initial_joints_deg'])
                     initial_report.update(collection_initial_joint_error_rad=error.tolist(),
@@ -617,12 +655,18 @@ def run_episodes(args, info, reference, action_limits, policy,
                             if temporal_window else None)
                 actions = []
                 policy_start = time.monotonic()
+                if repeat_spec is not None:
+                    repeated = RepeatedTask(repeat_spec, reply, started_wall=policy_start)
+                    status.update(repeated.result())
+                    atomic_json(folder / 'repeat_task_spec.json', repeat_spec)
+                    atomic_json(folder / 'goal_updates.json', [])
                 report_progress('rollout', force=True)
                 for step in range(args.steps):
                     step_started = time.perf_counter()
                     policy_latency_ms = None
                     # Validate every returned observation, including between replans.
                     state_pre = validate_state(reply)
+                    repeat_cycle_index = len(repeated.cycles) if repeated is not None else None
                     if observation_history is not None:
                         observation_history.append(policy_batch(frames, state_pre, reply['task_text']), step)
                     input_state = state_pre.tolist()
@@ -687,9 +731,16 @@ def run_episodes(args, info, reference, action_limits, policy,
                         raise ValueError('Identity payload exceeds current truck count')
                     bucket_q = float(reply['joint_positions'][3])
                     bucket_open = bucket_q >= BUCKET_OPEN_RAD
-                    success = completion.observe(count, bucket_q)
-                    stable_steps = completion.consecutive
                     elapsed = time.monotonic() - policy_start
+                    repeat_event = None
+                    if repeated is not None:
+                        repeat_event = repeated.observe(reply, step, time.monotonic())
+                        status.update(repeated.result())
+                        success = status['repeat_collection_success']
+                        stable_steps = repeated.dump_consecutive
+                    else:
+                        success = completion.observe(count, bucket_q)
+                        stable_steps = completion.consecutive
                     status.update(success=success, task_completed_success_and_bucket_open=success,
                                   completion_observations=stable_steps,
                                   policy_steps_executed=step + 1, final_newly_deposited_particle_count=count,
@@ -699,7 +750,7 @@ def run_episodes(args, info, reference, action_limits, policy,
                     if success and 'success_time_from_policy_start_seconds' not in status:
                         status['success_time_from_policy_start_seconds'] = elapsed
                         status['success_time_from_simulation_launch_seconds'] = time.monotonic() - started
-                        if getattr(args, 'replay_full_reference', False):
+                        if getattr(args, 'replay_full_reference', False) or repeated is not None:
                             status['task_completion_time_from_policy_start_seconds'] = elapsed
                             status['task_completion_time_from_simulation_launch_seconds'] = time.monotonic() - started
                     if store is not None:
@@ -723,6 +774,12 @@ def run_episodes(args, info, reference, action_limits, policy,
                                             'deposited_particles': count, 'stable_steps': stable_steps,
                                             'bucket_position': bucket_q, 'bridge_timing': reply['bridge_timing'],
                                             'particle_transfer_metrics': reply['particle_transfer_metrics'],
+                                            **({'repeat_cycle_index': repeat_cycle_index,
+                                                'evaluation_particle_ids': reply['evaluation_particle_ids'],
+                                                'repeat_bucket_particles': reply['bucket_load_metrics']['count'],
+                                                'bucket_landmarks_world': reply['bucket_landmarks_world'],
+                                                'goal_revision': reply['observation_context'].get('goal_revision', 0)}
+                                               if repeated is not None else {}),
                                             'truck_bed_load_metrics': reply['truck_bed_load_metrics'],
                                             'pre_action_camera_sha256': pre_action_camera_sha256,
                                             'camera_sha256': post_action_camera_sha256,
@@ -735,6 +792,27 @@ def run_episodes(args, info, reference, action_limits, policy,
                         video.write(reply, {**status, 'status': 'running'}, stable_steps)
                     report_progress('rollout')
                     frames = post_action_frames
+                    if repeated is not None:
+                        if repeat_event == 'finished':
+                            status.update(early_terminated=True, termination_reason='repeat_task_completed'
+                                if success else repeated.failure_reason)
+                            break
+                        if repeat_event == 'next_cycle':
+                            goal = repeat_spec['goals'][len(repeated.cycles)]
+                            command = {'type': 'set_task_goals', 'revision': len(repeated.cycles), **goal}
+                            updated = exchange(sock, command)
+                            verify_goal_ack(reply, updated, goal, len(repeated.cycles))
+                            updates = json.loads((folder / 'goal_updates.json').read_text())
+                            updates.append({'after_step': step, 'command': command,
+                                'physics_ticks': updated['bridge_timing']['physics_ticks'],
+                                'simulated_seconds': updated['bridge_timing']['simulated_seconds'],
+                                'camera_sha256': frame_hashes(decoded_frames(updated)),
+                                'joint_command_positions': updated['joint_command_positions']})
+                            atomic_json(folder / 'goal_updates.json', updates)
+                            reply, frames = updated, decoded_frames(updated)
+                            repeated.advance(reply, time.monotonic())
+                            actions.clear()  # Old chunks are conditioned on the previous goal.
+                        continue
                     if success and bucket_open and not getattr(args, 'replay_full_reference', False):
                         status.update(early_terminated=True, termination_reason='success_and_bucket_open',
                                       task_completion_time_from_policy_start_seconds=elapsed,
@@ -787,6 +865,16 @@ def run_episodes(args, info, reference, action_limits, policy,
             if policy_start is not None:
                 status.setdefault('rollout_time_from_policy_start_seconds', time.monotonic() - policy_start)
                 status.setdefault('rollout_time_from_simulation_launch_seconds', time.monotonic() - started)
+            if repeated is not None:
+                status.update(repeated.result(final=True))
+                atomic_json(folder / 'repeat_metrics.json', repeated.result(final=True))
+                if status['status'] == 'completed':
+                    try:
+                        atomic_json(folder / 'repeat_audit.json', audit_repeat_trace(folder, repeat_spec, status))
+                    except Exception as exc:
+                        status.update(status='error', error=f'RepeatedTraceAuditError: {exc}', success=False,
+                                      task_completed_success_and_bucket_open=False)
+                        failed = True
             metrics.finalize(status, status.get('rollout_time_from_policy_start_seconds'))
             status['clipped_action_fraction'] = (status['clipped_action_dimensions'] /
                                                  max(1, status['applied_action_dimensions']))
@@ -804,6 +892,8 @@ def run_episodes(args, info, reference, action_limits, policy,
                               observed_completion_before_error=bool(status['success']),
                               success=False, task_completed_success_and_bucket_open=False)
             status['failure_mode'] = failure_mode(status)
+            if repeated is not None and status['status'] == 'completed':
+                status['failure_mode'] = status['repeat_failure_mode']
             if diagnostics is not None:
                 status['diagnostics'] = diagnostics.summary()
                 atomic_json(folder / 'diagnostics.json', status['diagnostics'])
