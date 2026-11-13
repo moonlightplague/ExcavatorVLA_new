@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-13 — Output artifact cleanup
+
+- Reclaim 21.03 GiB of allocated space in `outputs/`, reducing usage from 142.30 to 121.27 GiB.
+- Remove 1,624 obsolete rollout videos, 108 evaluation RGB frame caches and 14 Python cache files. Shorten 1,394 inactive text logs to their first 32 KiB and final 96 KiB with an explicit truncation marker.
+- Preserve datasets, raw recovery/training captures, numeric traces and metrics, frozen sources, complete final checkpoints, and the explicitly retained PI05 comparison milestones (ten repeated-data checkpoints and five single-cycle checkpoints).
+- Preserve the archived ACT baseline and its original evaluation videos, the original combined-random evaluation, and all PI05 comparison outputs. Historical summaries remain; removed visual artifacts require rerunning their evaluations.
+- Verify that all 31,238 retained regular files keep their original inode, size and modification time, all 41 numeric checkpoints remain across 28 checkpoint groups, and no symlinks become broken. Pass the preserved ACT baseline checksum audit before and after cleanup, including 826 archived files and 80 original videos.
+- Confirm no running job uses the outputs selected for cleanup. Existing root/submodule ignore rules continue to exclude generated outputs, and all submodules remain unchanged.
+
 ## 2026-11-13 — Latest coarse MPM repeat pipeline
 
 - Integrate the baseline's explicit soil-profile checks, mass-aware coarse planning and actual-source surface queries.
