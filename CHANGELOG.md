@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-13 — Latest coarse MPM repeat pipeline
+
+- Integrate the baseline's explicit soil-profile checks, mass-aware coarse planning and actual-source surface queries.
+- Enforce the requested 50 kg minimum delivered load in every coarse dig, including the final rounds, with independent export and retained-metadata audits.
+- Add an explicit coarse mass policy and convert native-grain control thresholds to mass units, retaining legacy quality decisions and physical geometry checks.
+- Retain all feasible coarse targets before ranking and align early cut completion with the requested delivered load.
+- Record 9/16 validated ten-dig exports (56.25%); all 90 accepted loads are at least 74.56 kg. The 95% Wilson interval is 33.18–76.90%, so a general above-50% rate guarantee remains unproven.
+- Preserve the historical fine recipe and document the provisional amount-9 coarse recipe, 4.52 qualifying exports/hour on two RTX 4090 GPUs, independent reader validation and failed prototypes in `baseline/COARSE_MPM_VALIDATION.md`.
+- Pass 196 CPU regression checks and remove 15.06 GB of task-generated datasets/diagnostics; retain ignored shared coarse experiment artifacts and existing training/evaluation assets.
+
 ## 2026-11-12 — Repository artifact maintenance
 
 - Maintain generated-artifact ignore rules in the root and all four submodules, including local tooling state, renderer caches, experiment tracking and coverage reports.
