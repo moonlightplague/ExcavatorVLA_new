@@ -157,6 +157,8 @@ class RepeatedTaskTests(unittest.TestCase):
 
 
 class SharedRolloutIntegrationTests(unittest.TestCase):
+    policy_kind = 'pi05'
+
     def test_model_loop_completes_five_returns_replans_goals_and_audits_continuous_history(self):
         from types import SimpleNamespace
         from unittest.mock import patch
@@ -166,9 +168,13 @@ class SharedRolloutIntegrationTests(unittest.TestCase):
         import eval_smolvla_success as evaluation
         from excavator_common.evaluation_metrics import ParticleTransferTracker
         from excavator_vlm.policies.pi05.history import make_history
+        from smolvla_history import history_spec as smolvla_history_spec
+        history = (smolvla_history_spec() if self.policy_kind == 'smolvla' else
+                   make_history([-6,-3,0]) if self.policy_kind == 'pi05' else make_history([0]))
+        count = 2 if self.policy_kind == 'diffusion' else 3
 
         class Model:
-            config = SimpleNamespace(n_obs_steps=3, excavator_observation_history=make_history([-6,-3,0]))
+            config = SimpleNamespace(n_obs_steps=count, excavator_observation_history=history)
             def reset(self): self.calls = []
             def predict_action_chunk(self, batch):
                 self.calls.append(batch['observation.state'].clone())
@@ -176,6 +182,8 @@ class SharedRolloutIntegrationTests(unittest.TestCase):
 
         settings = spec()
         model, global_ids = Model(), ParticleTransferTracker()
+        if self.policy_kind != 'diffusion':
+            model.history = history
         context = {'allow_task_goal_updates': True, 'goal_revision': 0, 'initial_heading_rad': 0.,
                    'phase_mode': 'auto', 'task_text': 'Dig five scoops.', **settings['goals'][0]}
         scripted, truck = [], []
@@ -225,13 +233,13 @@ class SharedRolloutIntegrationTests(unittest.TestCase):
             session = SimpleNamespace(command=[], log_path=log, sock=None,
                 prepare=lambda seed: {}, close=lambda: None)
             args = SimpleNamespace(output=output, episodes=1, worker_index=0, worker_count=1,
-                policy_type='pi05', gpu_label='fixture', seed=2, min_particles=100, video=False,
+                policy_type=self.policy_kind, gpu_label='fixture', seed=2, min_particles=100, video=False,
                 steps=150, replan_interval=3, save_trajectory=False, progress_interval=0.,
                 replay_reference=False, fresh_simulator=True, post_rollout_observe_steps=0)
             config = {'execution_source': 'model', 'evaluation_standard': 'excavator_repeat_reference_v1',
                 'evaluation_profile': 'diagnostic', 'evaluation_id': 'fixture', 'checkpoint_sha256': 'fixture',
                 'simulation_settings': scene['simulation_settings'], 'repeat_spec': settings,
-                'observation_history': make_history([-6,-3,0])}
+                'observation_history': history}
             (output/'config.json').write_text(json.dumps(config))
             frames = {str(i): np.zeros((256,256,3), dtype=np.uint8) for i in range(3)}
             with patch.object(evaluation, 'exchange', side_effect=exchange), \
@@ -244,7 +252,17 @@ class SharedRolloutIntegrationTests(unittest.TestCase):
             self.assertEqual(result['repeat_cycles_completed'], 5)
             self.assertEqual(result['policy_steps_executed'], 35)
             self.assertEqual(len(model.calls), 15)  # Cached old-goal actions are discarded after every return.
+            if self.policy_kind == 'diffusion':
+                self.assertTrue(all(batch.ndim == 2 for batch in model.calls))
             self.assertEqual(json.loads((output/'episodes/episode_0001/repeat_audit.json').read_text())['status'], 'passed')
+
+
+class SmolVLAHistorySharedRolloutIntegrationTests(SharedRolloutIntegrationTests):
+    policy_kind = 'smolvla'
+
+
+class OtherPolicyObservationCountRegressionTests(SharedRolloutIntegrationTests):
+    policy_kind = 'diffusion'
 
 
 if __name__ == '__main__':

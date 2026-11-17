@@ -72,7 +72,7 @@ def reference_setup(path, fps):
     from excavator_common.vla_observation_contract import STATE_NAMES_28D, ACTION_NAMES_4D
 
     data = json.loads(Path(path).read_text())
-    if (data.get('schema_version') != 'excavator_reference_setup_v1'
+    if (data.get('schema_version') not in ('excavator_reference_setup_v1', 'excavator_scene_setup_v2')
             or data.get('fps') != fps or data.get('action_units') != 'rad/s'):
         raise ValueError('Reference setup schema, action units or control FPS differ')
     if data.get('state_names') != list(STATE_NAMES_28D) or data.get('action_names') != list(ACTION_NAMES_4D):
@@ -96,6 +96,11 @@ def reference_setup(path, fps):
     if not np.allclose(np.degrees(result['expected_initial_state'][:4]),
                        result['initial_joints_deg'], rtol=0, atol=1e-5):
         raise ValueError('Reference initial pose and expected state disagree')
+    if data['schema_version'] == 'excavator_scene_setup_v2':
+        if 'actions' in data:
+            raise ValueError('Scene-only evaluation references must not contain expert actions')
+        result['actions'] = np.empty((0, 4), dtype=np.float32)
+        return result
     actions = np.asarray(data['actions'], dtype=np.float32)
     if actions.ndim != 2 or actions.shape[1] != 4 or not len(actions) or not np.isfinite(actions).all():
         raise ValueError('Reference setup requires nonempty finite [T,4] exported actions')

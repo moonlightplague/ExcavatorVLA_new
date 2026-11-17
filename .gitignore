@@ -5,7 +5,7 @@ isaacsim
 outputs
 recent*
 /models
-.venv-smolvla/
+.venv-smolvla*
 .venv-pi05/
 __pycache__/
 .agents/

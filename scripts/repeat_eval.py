@@ -12,6 +12,11 @@ from excavator_common.evaluation_standard import BUCKET_OPEN_RAD, COMPLETION_OBS
 from excavator_common.vla_observation_contract import point_delta_in_heading_frame
 
 STANDARD = 'excavator_repeat_reference_v1'
+MASS_STANDARD = 'excavator_repeat_mass_reference_v2'
+PHYSICAL_MASS_STANDARD = 'excavator_repeat_physical_mass_reference_v3'
+MATERIAL_MASS_STANDARD = 'excavator_repeat_material_identity_reference_v4'
+PHYSICAL_MASS_STANDARDS = (PHYSICAL_MASS_STANDARD, MATERIAL_MASS_STANDARD)
+MASS_STANDARDS = (MASS_STANDARD, *PHYSICAL_MASS_STANDARDS)
 
 
 def read(path):
@@ -32,6 +37,8 @@ def vector(value):
 def load_repeat_spec(dataset, reference_path, cycles, cycle_steps, strict_minimum):
     dataset, reference_path = Path(dataset), Path(reference_path)
     reference = read(reference_path)
+    if reference.get('schema_version') == 'excavator_scene_setup_v2':
+        return load_mass_repeat_spec(dataset, reference, cycles, cycle_steps, strict_minimum)
     eid = reference['provenance']['source_export_episode']
     metadata = dataset / f'provenance/episode_{eid:04d}/meta.json'
     index = dataset / f'provenance/episode_{eid:04d}/episode_index_record.json'
@@ -84,6 +91,77 @@ def load_repeat_spec(dataset, reference_path, cycles, cycle_steps, strict_minimu
                      'fixed recorded task goals, not live collection replanning or novel-scene generalization.'}
 
 
+def load_mass_repeat_spec(dataset, reference, cycles, cycle_steps, strict_minimum):
+    """Bind a held-out ten-cycle scene to immutable collection receipts and gates."""
+    provenance = reference['provenance']
+    evidence = provenance['source_evidence']
+    if (not all(provenance[k] in evidence for k in
+                ('source_meta', 'source_receipt', 'source_quality_gate'))
+            or any(digest(path) != sha for path, sha in evidence.items())):
+        raise ValueError('Ten-cycle source evidence checksum differs')
+    meta = read(provenance['source_meta'])
+    receipt = read(provenance['source_receipt'])
+    gate = read(provenance['source_quality_gate'])
+    if (cycles != 10 or not receipt.get('validated') or not meta.get('success')
+            or receipt['export_episode_index'] != provenance['source_export_episode']
+            or receipt['episode_id'] != meta['episode_id']
+            or Path(receipt['export_dir']).resolve() != Path(dataset).resolve()
+            or meta['scoops_completed'] != cycles or len(meta['repeat_cycles']) != cycles):
+        raise ValueError('Ten-cycle scene is not a complete validated source parent')
+    baseline = meta['repeat_baseline']
+    soil = baseline['soil']['mpm']
+    if (baseline['soil_backend'] != 'newton_mpm' or soil['profile'] != 'coarse'
+            or gate['repeat_acceptance_profile'] != 'coarse_mass'
+            or not meta['repeat_episode_quality']['success']):
+        raise ValueError('Ten-cycle evaluation requires the original coarse Newton mass policy')
+    if [row['scoop_index'] for row in meta['scoop_results']] != list(range(cycles)):
+        raise ValueError('Recorded ten-cycle task goals are out of order')
+    goals = [{'dig_target_xyz': vector(row['target_xyz']),
+              'unload_landing_xyz': vector(row['unload_landing_xyz'])}
+             for row in meta['scoop_results']]
+    if (len(goals) != cycles or reference['dig_target_xyz'] != goals[0]['dig_target_xyz']
+            or reference['profile']['unload_landing_xyz'] != goals[0]['unload_landing_xyz']):
+        raise ValueError('Recorded initial task goals differ')
+    mass = soil['metric_point_mass_kg']
+    minimum_kg = gate['repeat_min_delivered_kg']
+    minimum = math.ceil(minimum_kg / mass)
+    from excavator_common.newton_source_identity import SOURCE_IDENTITY
+    if baseline['source_identity'] != SOURCE_IDENTITY:
+        raise ValueError('Collection source material identity is unsupported')
+    source_search = baseline['source_search_initial']
+    radius = float(source_search['radius_m'])
+    if (not math.isfinite(radius) or radius <= 0
+            or source_search['source'] != 'current_Newton_birth_material_excluding_bucket_and_truck'
+            or not np.allclose(source_search['authored_pile_center'][:2], reference['profile']['sand_xy'], atol=1e-5)):
+        raise ValueError('Collection Newton source search geometry is invalid')
+    source_metrics = read(Path(provenance['source_meta']).with_name('repeat_metrics.json'))
+    if cycle_steps != 0:
+        raise ValueError('Physical ten-cycle evaluation uses the episode budget; set --repeat-cycle-steps 0')
+    scene = meta['scene_randomization']['applied']['scene_context']
+    polygon = np.asarray(scene['sand_polygon_xy'], dtype=float)
+    if polygon.ndim != 2 or polygon.shape[0] < 3 or polygon.shape[1] != 2 or not np.isfinite(polygon).all():
+        raise ValueError('Recorded physical pile footprint is invalid')
+    return dict(version=MATERIAL_MASS_STANDARD, cycles=cycles, fps=reference['fps'], cycle_step_limit=0,
+                source_identity=SOURCE_IDENTITY, recorded_source_count=source_metrics['source_particle_count'],
+                pile_radius_m=radius, pile_region_method='collection_Newton_source_search_initial_radius',
+                goal_source='recorded_heldout_parent_task_coordinates_not_expert_actions_or_live_replanning',
+                task=reference['task'], goals=goals, min_payload_particles=minimum,
+                min_scooped_particles=minimum, strict_min_payload_particles=strict_minimum,
+                metric_point_mass_kg=mass, expected_metric_points=soil['metric_points'],
+                minimum_per_cycle_kg=minimum_kg,
+                minimum_retention_ratio=gate['repeat_min_retained_delivery_ratio'],
+                pile_polygon_xy=polygon.tolist(), pile_center_xy=reference['profile']['sand_xy'],
+                truck_center_xy=scene['unload_bin_center'][:2],
+                ground_top_z=baseline['ground_top_z'],
+                dig_max_height_m=2.5, carry_min_height_m=1.2, carry_bucket_closed_rad=-1.,
+                return_height_above_ground_m=[.15, 2.5],
+                return_empty_bucket_particles=5, return_consecutive_observations=3,
+                physical_event_observations=3,
+                source_evidence=evidence,
+                scope='Ten model-controlled dig/dump/physical-return cycles in each sealed test parent scene; '
+                      'recorded task coordinates, freshly settled soil, no teacher actions or phase labels.')
+
+
 def source_ids(reply):
     ids = reply.get('evaluation_particle_ids')
     if not isinstance(ids, dict) or not all(k in ids for k in ('particle_count', 'bucket', 'truck')):
@@ -98,7 +176,29 @@ class RepeatedTask:
         self.last_step = -1
         self.finished = False
         self.failure_reason = None
+        self.global_tracker = ParticleTransferTracker()
+        self.global_transfer = self._global_transfer(source_ids(initial_reply))
         self.start_cycle(initial_reply, 0, time.monotonic() if started_wall is None else started_wall)
+
+    def _global_transfer(self, ids):
+        if self.spec.get('version') in MASS_STANDARDS:
+            mass = ids.get('metric_point_mass_kg', 0)
+            if (ids.get('soil_backend') != 'newton_mpm' or not math.isfinite(mass)
+                    or not math.isclose(mass, self.spec['metric_point_mass_kg'], rel_tol=1e-5)
+                    or ids['particle_count'] != self.spec['expected_metric_points']):
+                raise ValueError('Live material IDs/mass/backend differ from the recorded coarse scene')
+        if self.spec.get('version') == MATERIAL_MASS_STANDARD:
+            excluded = tuple(ids.get('initial_excluded_ids', []))
+            identity = (ids.get('source_count'), excluded)
+            if (ids.get('source_identity') != self.spec['source_identity']
+                    or ids.get('source_count') != ids['particle_count'] - len(set(excluded))
+                    or not 0 < ids['source_count'] <= ids['particle_count']
+                    or set(excluded) & (set(ids['bucket']) | set(ids['truck']))
+                    or any(type(i) is not int or not 0 <= i < ids['particle_count'] for i in excluded)
+                    or getattr(self, '_source_identity_snapshot', identity) != identity):
+                raise ValueError('Live source material provenance differs from collection')
+            self._source_identity_snapshot = identity
+        return self.global_tracker.observe(ids['particle_count'], ids['bucket'], ids['truck'])
 
     def start_cycle(self, reply, start_step, wall):
         ids = source_ids(reply)
@@ -119,7 +219,9 @@ class RepeatedTask:
         if self.finished or self.phase == 'await_goal_update' or step != self.last_step + 1:
             raise ValueError('Repeated task observations must be consecutive and use the updated task goal')
         self.last_step = step
-        self.transfer = self._transfer(source_ids(reply))
+        ids = source_ids(reply)
+        self.global_transfer = self._global_transfer(ids)
+        self.transfer = self._transfer(ids)
         state = reply['observation_state_28d']
         if len(state) != 28 or not np.isfinite(state).all():
             raise ValueError('Invalid repeated-task observation')
@@ -157,7 +259,7 @@ class RepeatedTask:
         self.start_cycle(reply, self.last_step + 1, wall)
 
     def _row(self, success, wall, reason):
-        return {'cycle_index': len(self.cycles), 'status': 'completed' if success else 'failed',
+        result = {'cycle_index': len(self.cycles), 'status': 'completed' if success else 'failed',
                 'success': bool(success), 'strict_success': bool(success and
                     self.transfer['payload_particles'] >= self.spec['strict_min_payload_particles']),
                 'returned': self.return_consecutive >= self.spec['return_consecutive_observations'],
@@ -166,6 +268,9 @@ class RepeatedTask:
                 'cycle_time_seconds': (self.last_step - self.start_step + 1) / self.spec['fps'] if success else None,
                 'runtime_seconds': max(0., wall - self.started_wall),
                 'goal': self.spec['goals'][len(self.cycles)], **self.transfer}
+        if self.spec.get('version') in MASS_STANDARDS:
+            result['delivered_mass_kg'] = self.transfer['payload_particles'] * self.spec['metric_point_mass_kg']
+        return result
 
     def result(self, *, final=False, wall=None):
         rows = list(self.cycles)
@@ -178,7 +283,25 @@ class RepeatedTask:
                      for i in range(len(rows), self.spec['cycles'])]
         completed = sum(row['success'] for row in self.cycles)
         success = completed == self.spec['cycles']
-        return {'repeat_schema_version': STANDARD, 'repeat_cycles_target': self.spec['cycles'],
+        mass_result = {}
+        if self.spec.get('version') in MASS_STANDARDS:
+            mass = self.spec['metric_point_mass_kg']
+            final_kg = self.global_transfer['payload_particles'] * mass
+            delivered_kg = sum(row['delivered_mass_kg'] for row in self.cycles)
+            retention = final_kg / delivered_kg if delivered_kg > 0 else None
+            required = self.spec['minimum_retention_ratio'] * self.spec['cycles'] * self.spec['minimum_per_cycle_kg']
+            retained = (final_kg >= required and retention is not None
+                        and retention >= self.spec['minimum_retention_ratio'])
+            if success and not retained:
+                self.failure_reason = 'insufficient_final_mass_or_deposit_retention'
+            success = success and retained
+            mass_result = dict(repeat_minimum_per_cycle_kg=self.spec['minimum_per_cycle_kg'],
+                               repeat_final_payload_mass_kg=final_kg,
+                               repeat_minimum_final_payload_kg=required,
+                               repeat_cumulative_delivered_mass_kg=delivered_kg,
+                               repeat_deposit_retention_ratio=retention,
+                               repeat_minimum_retention_ratio=self.spec['minimum_retention_ratio'])
+        return {'repeat_schema_version': self.spec.get('version', STANDARD), 'repeat_cycles_target': self.spec['cycles'],
                 'repeat_min_payload_particles': self.spec['min_payload_particles'],
                 'repeat_strict_min_payload_particles': self.spec['strict_min_payload_particles'],
                 'repeat_cycles_completed': completed,
@@ -188,7 +311,8 @@ class RepeatedTask:
                 'repeat_cycle_index': min(len(self.cycles), self.spec['cycles'] - 1),
                 'repeat_phase': self.phase, 'repeat_cycles': rows,
                 'repeat_cycle_payload_particles': self.transfer['payload_particles'],
-                'repeat_failure_mode': 'none' if success else self.failure_reason or 'incomplete_repeated_task'}
+                'repeat_failure_mode': 'none' if success else self.failure_reason or 'incomplete_repeated_task',
+                **mass_result}
 
 
 def verify_goal_ack(before, after, goal, revision):
@@ -212,7 +336,7 @@ def verify_goal_ack(before, after, goal, revision):
 def audit_repeat_trace(folder, spec, expected):
     folder = Path(folder)
     initial = read(folder / 'initial_observation.json')
-    machine = RepeatedTask(spec, {'evaluation_particle_ids': initial['evaluation_particle_ids']}, started_wall=0.)
+    machine = make_repeated_task(spec, {'evaluation_particle_ids': initial['evaluation_particle_ids']}, started_wall=0.)
     rows = [json.loads(line) for line in (folder / 'steps.jsonl').read_text().splitlines()]
     heading_origin = initial['observation_context']['initial_heading_rad']
     history = read(folder.parent.parent / 'config.json').get('observation_history', {}).get('delta_indices', [0])
@@ -232,6 +356,7 @@ def audit_repeat_trace(folder, spec, expected):
             raise ValueError('Trace task-goal geometry differs from the active repeated task')
         reply = {'evaluation_particle_ids': row['evaluation_particle_ids'],
                  'observation_state_28d': row['state'],
+                 'bucket_landmarks_world': row['bucket_landmarks_world'],
                  'bucket_load_metrics': {'count': row['repeat_bucket_particles']}}
         event = machine.observe(reply, step, step / spec['fps'])
         if event == 'next_cycle':
@@ -242,12 +367,21 @@ def audit_repeat_trace(folder, spec, expected):
     for key in ('repeat_cycles_completed', 'repeat_returns_completed', 'repeat_collection_success', 'repeat_strict_success'):
         if actual[key] != expected[key]:
             raise ValueError(f'Repeated task summary differs from saved trace: {key}')
+    if spec.get('version') in MASS_STANDARDS:
+        for key in ('repeat_final_payload_mass_kg', 'repeat_cumulative_delivered_mass_kg',
+                    'repeat_deposit_retention_ratio', 'repeat_minimum_final_payload_kg'):
+            if actual[key] != expected[key]:
+                raise ValueError(f'Repeated mass summary differs from saved trace: {key}')
+    if spec.get('version') in PHYSICAL_MASS_STANDARDS:
+        if actual['repeat_cycles_successful'] != expected['repeat_cycles_successful']:
+            raise ValueError('Successful deposits differ from the physical-cycle count')
     for a, b in zip(actual['repeat_cycles'], expected['repeat_cycles']):
         for key in ('status', 'returned', 'strict_success', 'payload_particles', 'scooped_particles', 'spillage_particles'):
             if a.get(key) != b.get(key):
                 raise ValueError(f'Repeated cycle accounting differs from saved trace: {key}')
     updates = read(folder / 'goal_updates.json')
-    transitions = [row for row in actual['repeat_cycles'] if row['success']][:spec['cycles'] - 1]
+    transitions = [row for row in actual['repeat_cycles'] if
+                   row.get('physical_cycle_completed', row['success'])][:spec['cycles'] - 1]
     if len(updates) != len(transitions):
         raise ValueError('Missing or extra repeated-task goal transition')
     for revision, (event, cycle) in enumerate(zip(updates, transitions), 1):
@@ -259,3 +393,10 @@ def audit_repeat_trace(folder, spec, expected):
             raise ValueError('Goal transition changed physical state or used an invalid cycle boundary')
     return {'status': 'passed', 'steps': len(rows), 'cycles_completed': actual['repeat_cycles_completed'],
             'check': 'independent event/ID/return reconstruction and active task-goal geometry'}
+
+
+def make_repeated_task(spec, initial_reply, *, started_wall=None):
+    if spec.get('version') in PHYSICAL_MASS_STANDARDS:
+        from repeat_mass_physical import PhysicalRepeatTask
+        return PhysicalRepeatTask(spec, initial_reply, started_wall=started_wall)
+    return RepeatedTask(spec, initial_reply, started_wall=started_wall)

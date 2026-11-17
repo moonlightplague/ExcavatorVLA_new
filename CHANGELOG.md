@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-11-17 — SmolVLA 20k held-out closed-loop evaluation
+
+- Bind the frozen 40-episode test split to validated original scene/export receipts, without embedding expert actions in evaluation references.
+- Add ten-cycle Newton coarse evaluation using the collection's solver and rock display, with live material-mass checks, per-cycle 50 kg deposits, physical returns and final retained-load scoring.
+- Preserve legacy five-cycle evaluation; add resumable dual-GPU scheduling, per-scene videos, provisional/final success rates and independent identity/history/geometry/mass trace audits.
+- Correct physical cycle counting to advance after unsuccessful deposits and recognize returns to the collection's recorded Newton source search region. Separate physical and successful counts, remove per-cycle early timeouts, add episode-15 recorded-motion regression coverage and invalidate/repeat the original 40-scene evaluation.
+- Match the collection's full Newton material provenance instead of filtering initial settled soil through an ellipse. Retain initial bucket/truck exclusions, validate source identity and capture material-position/unload snapshots; invalidate the mismatched evaluation without changing training data, model weights or soil physics.
+- Validate 106 related main-repository tests and all 72 SmolVLA submodule tests before publication; document synchronous cadence and the remaining fixed-length rollout limitation.
+
+## 2026-11-16 — SmolVLA causal visual history
+
+- Reuse PI05's causal `[-6,-3,0]` control-frame sampling, camera order, episode padding and per-step buffer for nine-image SmolVLA conditioning; retain native current-state/action representations and pretrained weights.
+- Audit the immutable repeated publication, freeze a 140/20/40 whole-episode split, fit train-only mean/std statistics, and keep phase annotations confined to offline evaluation.
+- Add strict history loading, complete 2k checkpoint retention/resume, live progress/loss curves, a gated 20k dual-GPU controller and final phase-stratified offline diagnostics.
+- Verify 49 focused tests plus real-model GPU memory, finite gradients, historical-image influence, padding invariance and exact checkpoint inference roundtrip; document the workflow and limits in `docs/smolvla_history.md`.
+- Isolate plotting/analysis dependencies without changing the model stack, validate loss-curve rendering before launch, and preserve numerical training progress if a live-plot refresh fails.
+
 ## 2026-11-13 — Output artifact cleanup
 
 - Reclaim 21.03 GiB of allocated space in `outputs/`, reducing usage from 142.30 to 121.27 GiB.

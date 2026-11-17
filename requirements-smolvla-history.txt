@@ -1,0 +1,4 @@
+# Install in a --system-site-packages venv based on ExcavatorVLA-current.
+# Keep the existing Torch/Transformers/LeRobot stack unchanged.
+matplotlib==3.10.7
+scipy==1.16.2

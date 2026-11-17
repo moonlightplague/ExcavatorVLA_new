@@ -246,6 +246,7 @@ class RolloutIntegrationTests(unittest.TestCase):
                 return SimpleNamespace(cpu=lambda: SimpleNamespace(numpy=lambda: np.zeros((1, 4))))
 
         policy = Mock()
+        policy.config = SimpleNamespace(n_obs_steps=1)
 
         def infer(batch):
             advance(.4)

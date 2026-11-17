@@ -1,0 +1,49 @@
+# Source is immutable. Prepared splits/statistics belong to this experiment.
+dataset:
+  repo_id: local/excavator
+  root: data/repeat
+  episodes: null
+  video_backend: pyav
+  image_transforms:
+    enable: false
+policy:
+  path: models/smolvla_base
+  device: cuda
+  load_vlm_weights: false
+  push_to_hub: false
+  freeze_vision_encoder: true
+  train_expert_only: true
+  train_state_proj: true
+  n_obs_steps: 3
+  chunk_size: 10
+  n_action_steps: 3
+  num_steps: 10
+  tokenizer_max_length: 64
+  optimizer_lr: 0.0001
+  optimizer_weight_decay: 0.0000000001
+  optimizer_grad_clip_norm: 10.0
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 20000
+  scheduler_decay_lr: 0.0000025
+observation_history:
+  delta_indices: [-6, -3, 0]
+prepared_data: outputs/experiments/smolvla_history_repeat20k_20261116_01/prepared
+steps: 20000
+batch_size: 16 # Logical batch per GPU, unchanged from training_config.yaml.
+num_workers: 8
+seed: 1000
+save_freq: 2000
+log_freq: 50
+eval_freq: 0
+save_checkpoint: true
+job_name: excavator_smolvla_history_repeat20k
+output_dir: outputs/experiments/smolvla_history_repeat20k_20261116_01/train
+wandb:
+  enable: false
+  project: excavator-smolvla
+launcher:
+  output_root: outputs/train/repeat
+  hf_home: models/hf-cache
+  gpu_ids: [0, 1]
+  mixed_precision: bf16
+  micro_batch_size: null # Set only after the real memory probe; logical batch stays 16.

@@ -46,7 +46,7 @@ from act_temporal_ensemble import TemporalActionEnsemble
 from act_carry_guard import CarryAttitudeGuard, CarryGuardSettings, settings_dict as carry_guard_settings
 from spillage_diagnostics import observe_after_rollout
 from collection_eval_scenes import load_scene_manifest, simulator_command as collection_scene_command
-from repeat_eval import RepeatedTask, load_repeat_spec, verify_goal_ack, audit_repeat_trace, STANDARD as REPEAT_STANDARD
+from repeat_eval import make_repeated_task, load_repeat_spec, verify_goal_ack, audit_repeat_trace, STANDARD as REPEAT_STANDARD
 
 CAMERA_IDS = ('0', '1', '2')
 
@@ -126,10 +126,10 @@ def main():
     parser.add_argument('--min-particles', type=int, default=100)
     parser.add_argument('--seed', type=int, default=2)
     parser.add_argument('--replan-interval', type=int, default=3)
-    parser.add_argument('--repeat-cycles', type=int, choices=(0, 5), default=0,
-                        help='Five-cycle recorded-goal diagnostic; every motion remains model-controlled')
+    parser.add_argument('--repeat-cycles', type=int, choices=(0, 5, 10), default=0,
+                        help='Recorded-goal repeated task; every motion remains model-controlled')
     parser.add_argument('--repeat-cycle-steps', type=int, default=500,
-                        help='Maximum executed actions per cycle, including its physical return')
+                        help='Legacy per-cycle action budget; ten-cycle physical evaluation uses 0 and the episode budget')
     parser.add_argument('--act-temporal-window', type=int, default=0,
                         help='ACT only: blend this many recent overlapping chunks at each action; '
                              '0 retains ordinary chunk execution. Requires --replan-interval 1.')
@@ -247,6 +247,8 @@ def main():
     if args.replay_reference and args.reference_episode is None:
         parser.error('--replay-reference requires --reference-episode')
     reference = reference_episode(args.reference_episode, info['fps']) if args.reference_episode else None
+    if args.replay_reference and not len(reference['actions']):
+        parser.error('Scene-only references cannot execute expert actions')
     if args.replay_full_reference and (not args.replay_reference or reference is None
                                        or args.steps < len(reference['actions'])):
         parser.error('Full reference replay requires expert replay and a step budget covering all actions')
@@ -258,11 +260,20 @@ def main():
         parser.error('--scene-manifest requires fresh simulators and cannot be mixed with reference replay')
     repeat_spec = None
     if args.repeat_cycles:
-        if (args.policy_type != 'pi05' or not args.reference_episode or not args.reference_episode.is_file()
+        supported_repeat = ((args.policy_type == 'pi05' and args.repeat_cycles == 5)
+                            or (args.policy_type == 'smolvla' and args.repeat_cycles == 10
+                                and (args.checkpoint / 'observation_history.json').is_file()
+                                and simulation_settings['soil_backend'] == 'newton_mpm'
+                                and os.environ.get('EXCAVATOR_MPM_COLLECTION_RUNTIME') == '1'
+                                and os.environ.get('EXCAVATOR_MPM_SOURCE_IDENTITY') ==
+                                    'newton_source_material_ids_excluding_initial_bucket_and_truck'))
+        if (not supported_repeat or not args.reference_episode or not args.reference_episode.is_file()
                 or args.replay_reference or args.expert_prefix_steps or args.act_carry_guard or args.scene_manifest
-                or args.repeat_cycle_steps < 1 or args.steps < args.repeat_cycles * args.repeat_cycle_steps):
-            parser.error('Repeated evaluation requires a PI05 model, recorded reference, no expert/guard, '
-                         'and a total budget covering five positive cycle budgets')
+                or args.repeat_cycle_steps < 0
+                or (args.repeat_cycles == 5 and args.repeat_cycle_steps < 1)
+                or args.steps < args.repeat_cycles * args.repeat_cycle_steps):
+            parser.error('Repeated evaluation requires a supported checkpoint/backend, recorded scene, '
+                         'no expert/guard, and a total budget covering all positive cycle budgets')
         repeat_spec = load_repeat_spec(args.dataset, args.reference_episode, args.repeat_cycles,
                                        args.repeat_cycle_steps, args.min_particles)
     scene_manifest_hash = None
@@ -313,8 +324,9 @@ def main():
     config.update(unload_target_method='reference_recorded' if reference else 'truck_bed_center',
                   initial_pose_method='reference_recorded' if reference else 'fixed_dataset_episode')
     if repeat_spec is not None:
-        config.update(repeat_spec=repeat_spec, evaluation_standard=REPEAT_STANDARD,
-                      replay_scope='five_cycle_model', evaluation_profile='diagnostic',
+        config.update(repeat_spec=repeat_spec, evaluation_standard=repeat_spec['version'],
+                      replay_scope='five_cycle_model' if args.repeat_cycles == 5 else '10_cycle_model',
+                      evaluation_profile='diagnostic',
                       dig_target_method='recorded_per_cycle_task_goal', unload_target_method='recorded_per_cycle_task_goal')
     if args.scene_manifest:
         config.update(scene_manifest_sha256=scene_manifest_hash,
@@ -329,6 +341,9 @@ def main():
         config['checkpoint_step'] = checkpoint_manifest['step']
         config['observation_history'] = history_spec(bind_history(
             saved_config, checkpoint_manifest.get('observation_history')))
+    elif args.policy_type == 'smolvla' and (args.checkpoint / 'observation_history.json').is_file():
+        from smolvla_history import validate_history
+        config['observation_history'] = validate_history(json.loads((args.checkpoint / 'observation_history.json').read_text()))
     config['metric_definitions'] = METRIC_DEFINITIONS
     if args.reference_episode and args.reference_episode.is_file():
         config['reference_setup_sha256'] = hashlib.sha256(args.reference_episode.read_bytes()).hexdigest()
@@ -416,8 +431,14 @@ def main():
             from excavator_vlm.policies.pi05.inference import load_pi05
             policy, preprocess, postprocess = load_pi05(args.checkpoint, 'cuda')
             policy_config = policy.config
+        elif args.policy_type == 'smolvla' and (args.checkpoint / 'observation_history.json').is_file():
+            from smolvla_history import load_history
+            policy, preprocess, postprocess = load_history(args.checkpoint, 'cuda')
+            policy_config = policy.config
         else:
             policy_config = PreTrainedConfig.from_pretrained(str(args.checkpoint))
+            if args.policy_type == 'smolvla' and policy_config.n_obs_steps != 1:
+                raise ValueError('Multi-observation SmolVLA needs its observation_history.json and local history loader')
         if policy_config.type != args.policy_type:
             raise ValueError('Checkpoint policy type differs from --policy-type')
         policy_config.device = 'cuda'
@@ -445,7 +466,7 @@ def main():
             policy = ExcavatorVQBeTPolicy.from_pretrained(
                 str(args.checkpoint), config=policy_config,
                 strict=True, local_files_only=True).to('cuda').eval()
-        elif args.policy_type != 'pi05':
+        elif args.policy_type != 'pi05' and policy is None:
             policy = get_policy_class(args.policy_type).from_pretrained(
                 str(args.checkpoint), config=policy_config,
                 strict=True, local_files_only=True).to('cuda').eval()
@@ -455,7 +476,8 @@ def main():
             raise ValueError('Expected a 4D action checkpoint')
         if list(policy.config.image_features) != [f'observation.images.{i}' for i in range(3)]:
             raise ValueError('Expected the three canonical camera keys in order')
-        if args.policy_type != 'pi05':
+        if args.policy_type != 'pi05' and not (args.policy_type == 'smolvla'
+                and (args.checkpoint / 'observation_history.json').is_file()):
             preprocess, postprocess = make_pre_post_processors(
                 policy.config, pretrained_path=str(args.checkpoint),
                 preprocessor_overrides={'device_processor': {'device': 'cuda'}},
@@ -552,6 +574,7 @@ def run_episodes(args, info, reference, action_limits, policy,
                 'retained_particles': metrics.transfer.get('retained_particles', 0),
                 'warnings': diagnostics.warnings() if diagnostics is not None else [],
                 'repeat_cycles_completed': status.get('repeat_cycles_completed'),
+                'repeat_cycles_successful': status.get('repeat_cycles_successful'),
                 'repeat_cycle_index': status.get('repeat_cycle_index'),
                 'repeat_phase': status.get('repeat_phase'),
             })
@@ -651,12 +674,20 @@ def run_episodes(args, info, reference, action_limits, policy,
                         raise ValueError('Checkpoint history cadence differs from the simulator')
                     if policy.config.n_obs_steps > 1:
                         observation_history = ObservationHistory(history_contract)
+                elif (getattr(args, 'policy_type', 'smolvla') == 'smolvla' and policy is not None
+                      and getattr(policy.config, 'n_obs_steps', 1) > 1):
+                    from smolvla_history import ObservationHistory, validate_history
+                    history_contract = validate_history(policy.history)
+                    if history_contract['fps'] != info['fps']:
+                        raise ValueError('Checkpoint history cadence differs from the simulator')
+                    status['observation_history'] = history_contract
+                    observation_history = ObservationHistory(history_contract)
                 ensemble = (TemporalActionEnsemble(temporal_window, temporal_decay)
                             if temporal_window else None)
                 actions = []
                 policy_start = time.monotonic()
                 if repeat_spec is not None:
-                    repeated = RepeatedTask(repeat_spec, reply, started_wall=policy_start)
+                    repeated = make_repeated_task(repeat_spec, reply, started_wall=policy_start)
                     status.update(repeated.result())
                     atomic_json(folder / 'repeat_task_spec.json', repeat_spec)
                     atomic_json(folder / 'goal_updates.json', [])
@@ -790,6 +821,11 @@ def run_episodes(args, info, reference, action_limits, policy,
                     trace.flush()
                     if video is not None:
                         video.write(reply, {**status, 'status': 'running'}, stable_steps)
+                        if repeated is not None and os.environ.get('EXCAVATOR_EVAL_MATERIAL_SNAPSHOTS') == '1':
+                            snapshot = ('before_unload' if getattr(repeated, 'carry_step', None) == step else
+                                        'after_unload' if repeated.dump_step is not None and step == repeated.dump_step+10 else None)
+                            if snapshot:
+                                video.snapshot(status, folder / f'cycle_{repeat_cycle_index+1:02d}_{snapshot}.png')
                     report_progress('rollout')
                     frames = post_action_frames
                     if repeated is not None:

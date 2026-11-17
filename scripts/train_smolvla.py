@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import yaml
 
@@ -29,7 +30,7 @@ def load_settings(path, run_output=None):
     launcher = settings.pop('launcher', {})
     if not isinstance(launcher, dict):
         raise ValueError('launcher must be a mapping.')
-    unknown = set(launcher) - {'output_root', 'hf_home', 'gpu_ids', 'mixed_precision'}
+    unknown = set(launcher) - {'output_root', 'hf_home', 'gpu_ids', 'mixed_precision', 'micro_batch_size'}
     if unknown:
         raise ValueError(f'Unknown launcher settings: {sorted(unknown)}')
     gpu_ids = launcher.get('gpu_ids', [0])
@@ -43,15 +44,41 @@ def load_settings(path, run_output=None):
     for section in ('dataset', 'policy'):
         if not isinstance(settings.get(section), dict):
             raise ValueError(f'{section} must be a mapping.')
+    history = settings.pop('observation_history', None)
+    prepared = settings.pop('prepared_data', None)
+    micro_batch = launcher.get('micro_batch_size')
+    if micro_batch is not None and (type(micro_batch) is not int or micro_batch < 1):
+        raise ValueError('launcher.micro_batch_size must be positive')
+    settings['dataset'].setdefault('root', str(BASE / 'data/repeat'))
     for section, key in [('dataset', 'root'), ('policy', 'path')]:
         if not settings[section].get(key):
             raise ValueError(f'{section}.{key} is required.')
         settings[section][key] = str(resolve_path(settings[section][key], path.parent))
+    dataset_root = Path(settings['dataset']['root'])
+    if not (dataset_root / 'meta/info.json').is_file() and (dataset_root / 'export_repeat/meta/info.json').is_file():
+        settings['dataset']['root'] = str(dataset_root / 'export_repeat')
     launcher = {
         'gpu_ids': gpu_ids, 'mixed_precision': precision,
         'hf_home': str(resolve_path(launcher.get('hf_home', 'models/hf-cache'), path.parent)),
         'output_root': str(resolve_path(launcher.get('output_root', 'outputs/train'), path.parent)),
     }
+    if history is not None:
+        from prepare_smolvla_history import resolve_dataset
+        from smolvla_history import history_spec
+        if not isinstance(history, dict) or set(history) != {'delta_indices'}:
+            raise ValueError('observation_history must specify delta_indices')
+        if settings['policy'].get('n_obs_steps') != 3 or not prepared:
+            raise ValueError('History training needs n_obs_steps=3 and prepared_data')
+        prepared = resolve_path(prepared, path.parent)
+        split = json.loads((prepared / 'split_manifest.json').read_text())
+        if settings['dataset'].get('episodes') not in (None, split['train']):
+            raise ValueError('Requested episodes differ from the frozen history training split')
+        settings['dataset']['root'] = str(resolve_dataset(settings['dataset']['root']))
+        settings['dataset']['episodes'] = split['train']
+        launcher.update(observation_history=history_spec(history['delta_indices']),
+                        prepared_data=str(prepared), micro_batch_size=micro_batch)
+    elif settings['policy'].get('n_obs_steps', 1) != 1:
+        raise ValueError('Multi-timestamp SmolVLA requires an explicit causal history contract')
     output = run_output or settings.get('output_dir')
     if output:
         settings['output_dir'] = str(resolve_path(output, path.parent))
@@ -97,6 +124,7 @@ def build_train_config(settings):
     policy['output_features'] = {'action': {'type': 'ACTION', 'shape': [4]}}
     settings['policy'] = policy
     cfg = draccus.decode(TrainPipelineConfig, settings)
+    cfg.policy.device = policy['device']
     for name in ('steps', 'batch_size', 'save_freq', 'log_freq'):
         value = getattr(cfg, name)
         if type(value) is not int or value < 1:
@@ -110,7 +138,7 @@ def build_train_config(settings):
     return cfg
 
 
-def install_trainer_adapters(trainer, cfg):
+def install_trainer_adapters(trainer, cfg, history=None, stats=None):
     """Keep compatibility changes local to this process, not site-packages."""
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
@@ -124,6 +152,13 @@ def install_trainer_adapters(trainer, cfg):
         if 'action_loss_weight' in dataset.features:
             dataset.delta_timestamps['action_loss_weight'] = list(dataset.delta_timestamps['action'])
             dataset.delta_indices['action_loss_weight'] = list(dataset.delta_indices['action'])
+        if history is not None:
+            import torch
+            from smolvla_history import configure_dataset
+            configure_dataset(dataset, history)
+            dataset.meta.stats = {**dataset.meta.stats, **{
+                key: {name: torch.tensor(value, dtype=torch.float32) for name, value in values.items()}
+                for key, values in stats.items()}}
         return dataset
 
     trainer.make_dataset = make_excavator_dataset
@@ -132,6 +167,12 @@ def install_trainer_adapters(trainer, cfg):
 
     @functools.wraps(make_policy)
     def make_excavator_policy(*args, **kwargs):
+        if history is not None:
+            from smolvla_history import bind_history, load_policy, MANIFEST
+            bind_history(cfg.policy, history)
+            checkpoint = Path(cfg.policy.pretrained_path)
+            return load_policy(checkpoint, config=cfg.policy,
+                initial_base=not (checkpoint / MANIFEST).exists() and not cfg.resume)
         # LeRobot otherwise classifies action_is_expert/action_loss_weight as
         # additional policy outputs because their names start with "action".
         meta = copy.copy(kwargs['ds_meta'])
@@ -151,10 +192,62 @@ def install_trainer_adapters(trainer, cfg):
         overrides.setdefault('tokenizer_processor', {}).update(
             max_length=cfg.policy.tokenizer_max_length, padding=cfg.policy.pad_language_to,
         )
-        return make_processors(*args, **kwargs)
+        pre, post = make_processors(*args, **kwargs)
+        if history is not None:
+            from smolvla_history import HistoryPreprocessor
+            pre = HistoryPreprocessor(pre, history)
+        return pre, post
 
     trainer.make_pre_post_processors = make_excavator_processors
     SmolVLAPolicy.forward = excavator_forward
+
+
+def microbatch_update(metrics, policy, batch, optimizer, grad_clip_norm, *, accelerator,
+                      lr_scheduler=None, lock=None, rabc_weights_provider=None, micro_batch_size=1):
+    """Split one logical batch while preserving the existing valid-action loss denominator."""
+    import contextlib
+    import torch
+    if rabc_weights_provider is not None or lock is not None:
+        raise ValueError('History microbatching does not support RA-BC or an external optimizer lock')
+    started = time.perf_counter()
+    size = batch['action'].shape[0]
+    weights = torch.ones_like(batch['action'][..., 0])
+    if 'action_is_pad' in batch:
+        weights = weights * ~batch['action_is_pad']
+    if 'action_loss_weight' in batch:
+        supervision = batch['action_loss_weight']
+        if supervision.ndim == 3:
+            supervision = supervision.squeeze(-1)
+        weights = weights * supervision
+    total = weights.sum().detach().clamp_min(1)
+    value = 0.
+    optimizer.zero_grad(set_to_none=True)
+    policy.train()
+    for start in range(0, size, micro_batch_size):
+        end = min(size, start + micro_batch_size)
+        part = {key: item[start:end] if (torch.is_tensor(item) and item.ndim and item.shape[0] == size)
+                or (isinstance(item, list) and len(item) == size) else item for key, item in batch.items()}
+        synchronization = accelerator.no_sync(policy) if end < size else contextlib.nullcontext()
+        with synchronization:
+            with accelerator.autocast():
+                loss, _ = policy(part)
+                scaled = loss * (weights[start:end].sum().detach() / total)
+            if not torch.isfinite(scaled):
+                raise FloatingPointError('Nonfinite history training loss')
+            accelerator.backward(scaled)
+        value += scaled.detach().item()
+    norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm or float('inf'))
+    if not torch.isfinite(norm):
+        raise FloatingPointError('Nonfinite history gradient norm')
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    if lr_scheduler is not None:
+        lr_scheduler.step()
+    metrics.loss = value
+    metrics.grad_norm = float(norm)
+    metrics.lr = optimizer.param_groups[0]['lr']
+    metrics.update_s = time.perf_counter() - started
+    return metrics, {'loss': value, 'supervised_action_fraction': weights.mean().item()}
 
 
 def excavator_forward(self, batch, noise=None, time=None, reduction='mean'):
@@ -218,8 +311,9 @@ def run_training(cfg, launcher, config_path):
         # All ranks validate the unused output path before rank 0 creates it.
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
-            cfg.output_dir.mkdir(parents=True, exist_ok=False)
-            (cfg.output_dir / 'training_config.yaml').write_text(config_path.read_text())
+            cfg.output_dir.mkdir(parents=True, exist_ok=cfg.resume)
+            if not cfg.resume:
+                (cfg.output_dir / 'training_config.yaml').write_text(config_path.read_text())
             (cfg.output_dir / 'resolved_training_config.json').write_text(
                 json.dumps({'launcher': launcher, 'training': cfg.to_dict()}, indent=2) + '\n',
             )
@@ -236,9 +330,41 @@ def run_training(cfg, launcher, config_path):
             logging.getLogger().addHandler(handler)
 
     trainer.init_logging = init_run_logging
-    install_trainer_adapters(trainer, cfg)
+    history = launcher.get('observation_history')
+    stats = None
+    if history is not None:
+        prepared = Path(launcher['prepared_data'])
+        stats = json.loads((prepared / 'normalization_stats.json').read_text())
+        trainer.get_step_checkpoint_dir = lambda output_dir, total_steps, step: output_dir / 'checkpoints' / f'step_{step}'
+        original_update = trainer.update_policy
+        consumed_step = 0
+        if cfg.resume:
+            consumed_step = json.loads((cfg.checkpoint_path / 'training_state/training_step.json').read_text())['step']
+
+        def update_and_record(*args, **kwargs):
+            nonlocal consumed_step
+            if launcher.get('micro_batch_size') is not None:
+                result = microbatch_update(*args, **kwargs, micro_batch_size=launcher['micro_batch_size'])
+            else:
+                result = original_update(*args, **kwargs)
+            consumed_step += 1
+            if accelerator.is_main_process:
+                record = {'step': consumed_step, 'loss': float(result[0].loss.val),
+                          'grad_norm': float(result[0].grad_norm.val), 'lr': float(result[0].lr.val),
+                          'update_seconds': float(result[0].update_s.val)}
+                with (cfg.output_dir / 'losses.jsonl').open('a') as stream:
+                    stream.write(json.dumps(record, allow_nan=False) + '\n')
+                from success_eval_runtime import atomic_json
+                atomic_json(cfg.output_dir / 'progress.json', {**record, 'status':'running', 'target_steps':cfg.steps})
+            return result
+
+        trainer.update_policy = update_and_record
+    install_trainer_adapters(trainer, cfg, history, stats)
     trainer.train(cfg, accelerator)
     if accelerator.is_main_process:
+        if history is not None:
+            from success_eval_runtime import atomic_json
+            atomic_json(cfg.output_dir / 'progress.json', {'status':'completed', 'step':consumed_step, 'target_steps':cfg.steps})
         print(f'Checkpoint: {cfg.output_dir / "checkpoints/last/pretrained_model"}', flush=True)
 
 
@@ -248,6 +374,8 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Validate and print applied settings without training.')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--run-output', help=argparse.SUPPRESS)
+    parser.add_argument('--resume', type=Path, help='Resume optimizer/scheduler/RNG state from a complete checkpoint directory.')
+    parser.add_argument('--config_path', help=argparse.SUPPRESS)
     args = parser.parse_args()
     config_path = args.config.resolve()
     settings, launcher = load_settings(config_path, args.run_output)
@@ -255,6 +383,27 @@ def main():
     if not args.worker:
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, launcher['gpu_ids']))
     cfg = build_train_config(settings)
+    if launcher.get('observation_history'):
+        from smolvla_history import bind_history
+        bind_history(cfg.policy, launcher['observation_history'])
+    if args.resume:
+        checkpoint = args.resume.resolve()
+        saved_cfg = json.loads((checkpoint / 'pretrained_model/train_config.json').read_text())
+        if saved_cfg['output_dir'] != str(cfg.output_dir):
+            raise ValueError('Resume must use the original --run-output directory')
+        current = cfg.to_dict()
+        for key in ('batch_size', 'seed', 'steps'):
+            if saved_cfg[key] != current[key]:
+                raise ValueError(f'Resume cannot change {key}')
+        if saved_cfg['dataset']['episodes'] != current['dataset']['episodes']:
+            raise ValueError('Resume cannot change the frozen training episodes')
+        for key in ('n_obs_steps','chunk_size','n_action_steps','normalization_mapping','optimizer_lr',
+                    'scheduler_warmup_steps','scheduler_decay_steps','freeze_vision_encoder','train_expert_only'):
+            if saved_cfg['policy'][key] != current['policy'][key]:
+                raise ValueError(f'Resume cannot change policy.{key}')
+        cfg.resume = True
+        sys.argv.append('--config_path=' + str(checkpoint / 'pretrained_model/train_config.json'))
+        cfg.validate()
     if args.dry_run:
         cfg.validate()
         print(json.dumps({'launcher': launcher, 'training': cfg.to_dict()}, indent=2))
@@ -268,6 +417,8 @@ def main():
             str(Path(__file__).resolve()), '--config', str(config_path),
             '--worker', '--run-output', str(cfg.output_dir),
         ]
+        if args.resume:
+            command += ['--resume', str(args.resume.resolve())]
         subprocess.run(command, check=True)
         return
     run_training(cfg, launcher, config_path)

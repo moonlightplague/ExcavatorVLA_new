@@ -43,6 +43,18 @@ def evaluation_provenance(base, checkpoint, dataset, protocol, software):
         sources.extend((base / 'ExcavatorVLA-vlm/excavator_vlm/data').glob('*.py'))
     if protocol.get('repeat_spec'):
         sources.append(base / 'scripts/repeat_eval.py')
+        if protocol['repeat_spec'].get('version') in ('excavator_repeat_mass_reference_v2',
+                                                     'excavator_repeat_physical_mass_reference_v3',
+                                                     'excavator_repeat_material_identity_reference_v4'):
+            sources.extend([base / 'scripts/eval_smolvla_repeat40.py',
+                base / 'scripts/repeat_mass_physical.py',
+                base / 'baseline/tuning.py',
+                base / 'ExcavatorVLA-isaac/scripts/excavator_app/newton_mpm_soil.py',
+                base / 'ExcavatorVLA-isaac/scripts/excavator_app/soil_rock_display.py',
+                base / 'ExcavatorVLA-isaac/scripts/excavator_app/assets/rock_relief_basecolor.png'])
+    if protocol.get('policy_type') == 'smolvla' and (checkpoint / 'observation_history.json').is_file():
+        sources.append(base / 'scripts/smolvla_history.py')
+        sources.append(base / 'ExcavatorVLA-vlm/excavator_vlm/policies/pi05/history.py')
     if protocol.get('scene_manifest_sha256'):
         sources.extend((base / 'baseline').glob('*.py'))
         sources.extend((base / 'ExcavatorVLA-isaac/scripts/excavator_app').glob('*.py'))

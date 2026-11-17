@@ -55,6 +55,12 @@ class EpisodeVideo:
                     f"Load {status.get('repeat_cycle_payload_particles', 0)}  |  "
                     f"Collection >= {status['repeat_min_payload_particles']}, "
                     f"strict >= {status['repeat_strict_min_payload_particles']}/cycle")
+            if 'repeat_minimum_per_cycle_kg' in status:
+                line = (f"Cycles {status.get('repeat_cycles_completed', 0)}/{status['repeat_cycles_target']}  |  "
+                        + (f"Passed {status['repeat_cycles_successful']}  |  " if 'repeat_cycles_successful' in status else '') +
+                        f"{status.get('repeat_phase', '')}  |  "
+                        f"Min {status['repeat_minimum_per_cycle_kg']:g} kg/cycle  |  "
+                        f"Truck {status.get('repeat_final_payload_mass_kg', 0):.1f} kg")
         else:
             line = (f'Deposited {count}/{self.min_particles} particles  |  '
                     f'Completion observations {self.stable_steps}/3  |  Bucket {bucket}')
@@ -68,9 +74,12 @@ class EpisodeVideo:
             strict = 'YES' if status.get('repeat_strict_success') else 'NO'
             result = (f"Collection: {collection}  |  Strict: {strict}  |  "
                       f"Returns {status.get('repeat_returns_completed', 0)}/{status['repeat_cycles_target']}")
+            if 'repeat_minimum_per_cycle_kg' in status:
+                result = (f"Ten-cycle task: {collection}  |  "
+                          f"Returns {status.get('repeat_returns_completed', 0)}/{status['repeat_cycles_target']}")
             if not status.get('repeat_collection_success'):
                 result += f"  |  {status.get('repeat_failure_mode', 'incomplete_repeated_task')}"
-            color = (90, 225, 130) if status.get('repeat_strict_success') else (255, 190, 90)
+            color = (90, 225, 130) if status.get('repeat_collection_success') else (255, 190, 90)
         elif status.get('success'):
             complete = 'YES' if status.get('task_completed_success_and_bucket_open') else 'NO'
             result = f'SUCCESS  |  Task complete: {complete}'
@@ -112,3 +121,6 @@ class EpisodeVideo:
         finally:
             if self.writer is not None:
                 self.writer.close()
+
+    def snapshot(self, status, path):
+        Image.fromarray(self.render(status)).save(path)
