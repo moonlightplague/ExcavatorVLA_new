@@ -39,7 +39,7 @@
 
 - `scripts/export_excavator_kinematics.py`：离线读取实际 USD 框架及原始车斗变换，输出带资产哈希的模型。
 - `scripts/excavator_reachability.py`：真实链 FK、保守工作空间上界、车斗/目标分开诊断和正向端点证据；IK 未解出只记待判。
-- `scripts/audit_act_reachability.py`：只读核对已保存场景、原资产快照、观测几何与关节解，保存协议、源码快照及输入哈希。
+- `scripts/analysis/audit_act_reachability.py`：只读核对已保存场景、原资产快照、观测几何与关节解，保存协议、源码快照及输入哈希。
 - 新增 12 项检查通过，覆盖远中心与可用近侧分开判断、远整车上界、高度影响、旋转/缩放车斗、坐标恢复、数值无解不能当作不可达、真实关节限位和路径未验标记。
 
 本轮交付是诊断工具与下一轮的场景准备规则，尚未在通用评估器中自动筛除场景，也未验证新的闭环增益。

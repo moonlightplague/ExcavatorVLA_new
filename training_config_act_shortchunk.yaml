@@ -1,0 +1,9 @@
+# Paired short-horizon experiment: preserve the original ACT objective and data.
+extends: training_config_act_original.yaml
+policy:
+  chunk_size: 10
+  n_action_steps: 3
+job_name: excavator_act_shortchunk_repeat40k
+output_dir: outputs/experiments/act_shortchunk_repeat40k_20261117_01/train
+benchmark:
+  split_file: outputs/experiments/act_shortchunk_repeat40k_20261117_01/prepared/split_manifest.json

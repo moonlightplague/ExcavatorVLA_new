@@ -4,13 +4,16 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import sys
 
 import numpy as np
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from excavator_reachability import (AuthoredExcavatorChain, TruckBedColumn, find_endpoint,
                                     restored_truck_geometry, workspace_bound)
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def sha(path):
@@ -80,10 +83,11 @@ def main():
     frozen = args.output/'frozen_sources'
     frozen.mkdir()
     source_files = {}
-    for name in ('audit_act_reachability.py', 'excavator_reachability.py', 'export_excavator_kinematics.py'):
-        source = ROOT/'scripts'/name
-        source_files[name] = sha(source)
-        shutil.copy2(source, frozen/name)
+    sources = [Path(__file__).resolve(), ROOT / 'scripts/excavator_reachability.py',
+               ROOT / 'scripts/export_excavator_kinematics.py']
+    for source in sources:
+        source_files[source.name] = sha(source)
+        shutil.copy2(source, frozen / source.name)
     protected = {str(path): sha(path) for scene in args.scenes
                  for path in (scene, scene.parent/'steps.jsonl', scene.parent/'episode_status.json')}
     write(args.output/'source_manifest.json', dict(scripts_sha256=source_files, inputs_sha256=protected))
@@ -116,8 +120,9 @@ def main():
             raise ValueError(f'Source result changed during the audit: {path}')
     if sha(args.model) != protocol['model_sha256']:
         raise ValueError('Authored geometry changed during the audit')
-    for name, expected in source_files.items():
-        if sha(ROOT/'scripts'/name) != expected or sha(frozen/name) != expected:
+    for source in sources:
+        expected = source_files[source.name]
+        if sha(source) != expected or sha(frozen / source.name) != expected:
             raise ValueError('Audit implementation changed during execution')
     write(args.output/'results.json', dict(protocol=protocol, scenes=results, source_inputs_unchanged=True))
     lines = ['# ACT 卸料目标与车斗可达性诊断', '',

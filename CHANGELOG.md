@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-18 — Repository organization
+
+- Move standalone audits and rollout analysis to `scripts/analysis/`, the historical R5 recipe to `scripts/experiments/r5/`, and environment preparation to `scripts/setup/prepare.sh`.
+- Split the README into setup, collection, training and evaluation guides. Group dated ACT reports under `docs/experiments/act/`. See the [repository guide](docs/README.md) for the new paths.
+
+## 2026-11-17 — Original ACT repeated-data training
+
+- Add an explicit original ACT objective using stock LeRobot `ACTPolicy.forward`, with provenance-aware stock checkpoint loading; preserve existing weighted-loss defaults.
+- Prepare the immutable completed repeat publication with the existing 140/20/40 episode split, train-only statistics and a 40k/100-action-chunk ACT configuration.
+- Add frozen-source supervision, real-data training/checkpoint preflight, live status, final validation and source checks; retain the final checkpoint after successful completion.
+
 ## 2026-11-17 — SmolVLA 20k held-out closed-loop evaluation
 
 - Bind the frozen 40-episode test split to validated original scene/export receipts, without embedding expert actions in evaluation references.

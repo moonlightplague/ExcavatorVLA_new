@@ -112,6 +112,6 @@ def audit(out,root):
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output',type=Path)
-    parser.add_argument('--root',type=Path,default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--root',type=Path,default=Path(__file__).resolve().parents[2])
     args=parser.parse_args()
     print(json.dumps(audit(args.output.resolve(),args.root.resolve()),ensure_ascii=False))

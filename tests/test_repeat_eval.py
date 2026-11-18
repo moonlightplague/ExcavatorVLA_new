@@ -171,7 +171,7 @@ class SharedRolloutIntegrationTests(unittest.TestCase):
         from smolvla_history import history_spec as smolvla_history_spec
         history = (smolvla_history_spec() if self.policy_kind == 'smolvla' else
                    make_history([-6,-3,0]) if self.policy_kind == 'pi05' else make_history([0]))
-        count = 2 if self.policy_kind == 'diffusion' else 3
+        count = 1 if self.policy_kind == 'act' else 2 if self.policy_kind == 'diffusion' else 3
 
         class Model:
             config = SimpleNamespace(n_obs_steps=count, excavator_observation_history=history)
@@ -252,13 +252,17 @@ class SharedRolloutIntegrationTests(unittest.TestCase):
             self.assertEqual(result['repeat_cycles_completed'], 5)
             self.assertEqual(result['policy_steps_executed'], 35)
             self.assertEqual(len(model.calls), 15)  # Cached old-goal actions are discarded after every return.
-            if self.policy_kind == 'diffusion':
+            if self.policy_kind in ('diffusion', 'act'):
                 self.assertTrue(all(batch.ndim == 2 for batch in model.calls))
             self.assertEqual(json.loads((output/'episodes/episode_0001/repeat_audit.json').read_text())['status'], 'passed')
 
 
 class SmolVLAHistorySharedRolloutIntegrationTests(SharedRolloutIntegrationTests):
     policy_kind = 'smolvla'
+
+
+class ACTSharedRolloutIntegrationTests(SharedRolloutIntegrationTests):
+    policy_kind = 'act'
 
 
 class OtherPolicyObservationCountRegressionTests(SharedRolloutIntegrationTests):

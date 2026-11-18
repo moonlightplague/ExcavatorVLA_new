@@ -36,7 +36,7 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def prepare(experiment, output):
+def prepare(experiment, output, policy_type="smolvla", replan_interval=None):
     import numpy as np
     import pandas as pd
     from baseline.coarse_acceptance import validate_mass_report
@@ -49,7 +49,13 @@ def prepare(experiment, output):
             or set(test_ids) & (set(split['train']) | set(split['validation']))):
         raise ValueError('Expected 40 distinct sealed parents with no train/validation overlap')
     dataset = (BASE / 'data/repeat/export_repeat').resolve()
-    checkpoint = experiment / 'train/checkpoints/step_20000/pretrained_model'
+    checkpoint = experiment / ('train/checkpoints/040000/pretrained_model' if policy_type == 'act' else 'train/checkpoints/step_20000/pretrained_model')
+    if policy_type == 'act':
+        status = read(experiment / 'status.json')
+        if status.get('phase') != 'completed' or status.get('step') != 40000:
+            raise ValueError('ACT training must be completed before evaluation')
+    if replan_interval is None:
+        replan_interval = 100 if policy_type == 'act' else 3
     if not (checkpoint / 'model.safetensors').is_file():
         raise ValueError('The completed step_20000 checkpoint is missing')
     info = read(dataset / 'meta/info.json')
@@ -119,10 +125,10 @@ def prepare(experiment, output):
         scenes.append(dict(evaluation_episode=position, source_export_episode=eid,
                            reference=str(path), reference_sha256=digest(path),
                            policy_seed=20261117 + position, source_parent=m['episode_id']))
-    manifest = dict(schema_version='smolvla_history_20k_heldout40_v3', created_from=str(experiment),
+    manifest = dict(schema_version=('act_original_40k_heldout40_v1' if policy_type == 'act' else 'smolvla_history_20k_heldout40_v3'), created_from=str(experiment),
                     checkpoint=str(checkpoint), dataset=str(dataset), split_sha256=digest(split_path),
                     requested_episodes=40, cycles_per_episode=10, cycle_step_limit=0, episode_step_limit=5000,
-                    replan_interval=3, control_hz=10, scenes=scenes,
+                    replan_interval=replan_interval, control_hz=10, scenes=scenes,
                     source_identity='newton_source_material_ids_excluding_initial_bucket_and_truck',
                     material_position_telemetry=True,
                     scope='Held-out recorded scene/task coordinates with freshly settled Newton coarse soil; '
@@ -138,6 +144,9 @@ def prepare(experiment, output):
                             'physical attempts and returns. No per-cycle early termination.',
                     infrastructure='Infrastructure errors are reported separately and retried explicitly; '
                                    'completed model failures are never replaced or retried.')
+    if policy_type == 'act':
+        manifest.update(policy_type='act', checkpoint_step=40000)
+        manifest['scope'] = manifest['scope'].replace('continuous history', 'current observation, predict 100 actions, execute ' + str(replan_interval))
     path = output / 'manifest.json'
     if path.exists() and read(path) != manifest:
         raise ValueError('Evaluation manifest differs from the existing output')
@@ -185,7 +194,7 @@ def summarize(output, manifest, active=None):
     physical_cycles = sum(r['repeat_cycles_completed'] for r in rows)
     complete = len(rows) == 40
     summary = dict(status='complete' if complete else 'running', updated_utc=now(),
-        checkpoint_step=20000, requested_episodes=40, completed_episodes=len(rows),
+        checkpoint_step=manifest.get('checkpoint_step', 20000), requested_episodes=40, completed_episodes=len(rows),
         successful_episodes=successes, task_success_rate=successes/len(rows) if rows else None,
         task_success_rate_95pct_wilson=wilson(successes, len(rows)),
         complete_test_success_rate=successes/40 if complete else None,
@@ -194,7 +203,7 @@ def summarize(output, manifest, active=None):
         cycle_success_rate=cycles/(len(rows)*10) if rows else None,
         infrastructure_errors=errors, active=active or {}, episodes=rows)
     atomic_json(output / 'summary.json', summary)
-    text = [f"SmolVLA history step 20,000: {len(rows)}/40 held-out scenes complete.",
+    text = [f"{manifest.get('policy_type', 'smolvla')} step {manifest.get('checkpoint_step', 20000):,}: {len(rows)}/40 held-out scenes complete.",
             f"Full ten-cycle task success: {successes}/{len(rows)}" +
             (f" ({100*successes/len(rows):.1f}%)." if rows else ' (pending).'),
             f"Physical dig/dump/return cycles: {physical_cycles}/{len(rows)*10}; successful deposits/returns: {cycles}/{len(rows)*10}.",
@@ -229,11 +238,11 @@ def evaluation_environment(output):
 
 def evaluation_command(manifest, scene, attempt, gpu):
     return [sys.executable, str(BASE / 'scripts/eval_smolvla_success.py'),
-        '--policy-type', 'smolvla', '--checkpoint', manifest['checkpoint'],
+        '--policy-type', manifest.get('policy_type', 'smolvla'), '--checkpoint', manifest['checkpoint'],
         '--dataset', manifest['dataset'], '--output', str(attempt / 'evaluation'),
         '--reference-episode', scene['reference'], '--episodes', '1',
         '--repeat-cycles', '10', '--repeat-cycle-steps', '0', '--steps', '5000',
-        '--replan-interval', '3', '--seed', str(scene['policy_seed']),
+        '--replan-interval', str(manifest['replan_interval']), '--seed', str(scene['policy_seed']),
         '--gpus', gpu, '--workers', '1', '--soil-backend', 'newton_mpm',
         '--cpu-threads', '12', '--video', '--headless', '--fresh-simulator',
         '--render-every-physics-step', '--progress-interval', '15']
@@ -264,7 +273,7 @@ def publish_completion(output, manifest, summary):
         video = folder / 'evaluation.mp4'
         if not video.is_file() or video.stat().st_size <= 0 or row.get('video_frames', 0) <= 20:
             raise ValueError('A completed trial is missing its evaluation video')
-    completion = dict(status='complete', finished_utc=now(), checkpoint_step=20000,
+    completion = dict(status='complete', finished_utc=now(), checkpoint_step=manifest.get('checkpoint_step', 20000),
                       completed_episodes=40, successful_episodes=summary['successful_episodes'],
                       task_success_rate=summary['complete_test_success_rate'],
                       task_success_rate_95pct_wilson=summary['task_success_rate_95pct_wilson'],
@@ -275,8 +284,10 @@ def publish_completion(output, manifest, summary):
     atomic_json(output / 'completion.json', completion)
     experiment = Path(manifest['created_from'])
     atomic_json(experiment / 'closedloop_evaluation.json', completion)
+    if manifest.get('policy_type') == 'act':
+        return
     original_report = experiment / 'REPORT.md'
-    text = original_report.read_text()
+    text = original_report.read_text() if original_report.exists() else ''
     new = (f"Closed-loop evaluation of the final 20k checkpoint on all 40 sealed test episodes is complete. "
            f"Full ten-cycle task success: **{summary['successful_episodes']}/40 "
            f"({100*summary['complete_test_success_rate']:.1f}%)**. "
@@ -354,6 +365,8 @@ def main():
     p.add_argument('--experiment', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--gpus', default='0,1')
+    p.add_argument('--policy-type', choices=('smolvla', 'act'), default='smolvla')
+    p.add_argument('--replan-interval', type=int)
     p.add_argument('--limit', type=int, default=0, help='Run a preparation subset; manifest always retains all 40')
     p.add_argument('--prepare-only', action='store_true')
     p.add_argument('--wait-for-pids', type=int, nargs='*', default=[],
@@ -361,7 +374,7 @@ def main():
     args = p.parse_args()
     if args.limit < 0 or args.limit > 40:
         p.error('limit must be in 0..40')
-    manifest = prepare(args.experiment, args.output)
+    manifest = prepare(args.experiment, args.output, args.policy_type, args.replan_interval)
     if args.prepare_only:
         summarize(args.output.resolve(), manifest)
         print(f'Prepared 40 sealed scenes: {args.output.resolve()}', flush=True)

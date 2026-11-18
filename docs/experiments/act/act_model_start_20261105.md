@@ -12,7 +12,7 @@
 
 因此这些记录不支持把这批停滞归因为保料层直接截断了有料时的动作。仍须核对模型看到的填料、目标、姿态等条件，以及是否实际形成持续离土运动，不能把所有未完成都算作模型起运失败或机械不可达。
 
-复核入口：`scripts/audit_act_start_stall.py`。逐场结果和来源 SHA256：`outputs/analysis/act_loaded_start_audit_20261105_01.json`。它只分析已有开发轨迹，不生成专家纠错标签，不改历史评分。
+复核入口：`scripts/analysis/audit_act_start_stall.py`。逐场结果和来源 SHA256：`outputs/analysis/act_loaded_start_audit_20261105_01.json`。它只分析已有开发轨迹，不生成专家纠错标签，不改历史评分。
 
 已有训练证据见 [后续优化记录](act_incremental_plan_20261103.md)：持料阶段动作幅度偏小、16 个观测可局部拟合；但增加阶段采样后持料误差只小幅下降，卸料误差变大。不能重复把全网续训或继续加采样权重当作已证实方案。
 

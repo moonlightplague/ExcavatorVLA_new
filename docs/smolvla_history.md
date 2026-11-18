@@ -342,7 +342,7 @@ unmatched, so this comparison cannot isolate the effect of visual history.
 No closed-loop excavation-success improvement is claimed without rollout evidence.
 No real excavator hardware commands are part of this pipeline.
 
-`scripts/analyze_smolvla_phase_pairs.py` additionally searches validation-only
+`scripts/analysis/analyze_smolvla_phase_pairs.py` additionally searches validation-only
 unloading/return observations for nearby joint poses and opposite action
 directions, preserving its criteria and selection in `phase_pairs/`. Any model
 history-masking comparison is a qualitative validation diagnostic, not a
@@ -364,7 +364,7 @@ alone does not establish that a single-timestamp policy is ambiguous.
 - `scripts/train_smolvla.py`: opt-in dataset/model/processor adapters, progress and resumable saves.
 - `scripts/eval_smolvla_success.py`, `scripts/success_eval_runtime.py`: causal rollout history and provenance.
 - `scripts/eval_smolvla_history_offline.py`: phase-stratified physical-action diagnostics.
-- `scripts/analyze_smolvla_phase_pairs.py`: validation-pose inspection and optional history masking.
+- `scripts/analysis/analyze_smolvla_phase_pairs.py`: validation-pose inspection and optional history masking.
 - `scripts/run_smolvla_history_experiment.py`: persistent controller, checkpoint checks and loss curves.
 - `tests/test_smolvla_history.py`, `tests/test_repeat_eval.py`: history/gradient and shared-rollout regressions.
 - `docs/smolvla_history.md`, `CHANGELOG.md`: implementation, verification and experiment notes.

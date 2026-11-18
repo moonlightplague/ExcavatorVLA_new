@@ -10,7 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'scripts'))
 from act_unload_snapshot import array_hash, capture, patch_simulator
 from run_act_unload_ablation import geometry_metrics, summarize
-from analyze_act_unload_ablation import alignment
+from analysis.analyze_act_unload_ablation import alignment
 
 
 class SnapshotValidationTests(unittest.TestCase):

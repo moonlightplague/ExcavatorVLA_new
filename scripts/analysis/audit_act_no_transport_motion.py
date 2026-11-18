@@ -3,8 +3,11 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from excavator_reachability import TruckBedColumn
 

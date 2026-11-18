@@ -12,6 +12,8 @@ from scipy.spatial import cKDTree
 import torch
 from torch.utils.data import default_collate
 
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 from smolvla_history import CAMERAS, MASK, configure_dataset, history_spec, inference_batch, load_history
 from excavator_vlm.data.contract import read_frames
 

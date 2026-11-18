@@ -40,9 +40,10 @@ def freeze(job):
     for pattern in ("*.py", "*.json"):
         for path in (ROOT / "ExcavatorVLA-isaac").glob(pattern):
             shutil.copy2(path, isaac / path.name)
-    (frozen / "scripts").mkdir()
-    for path in (ROOT / "scripts").glob("*.py"):
-        shutil.copy2(path, frozen / "scripts" / path.name)
+    for path in (ROOT / 'scripts').rglob('*.py'):
+        target = frozen / path.relative_to(ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
     for name in ("run_isaac_python.sh", "training_config.yaml"):
         shutil.copy2(ROOT / name, frozen / name)
     (frozen / "isaacsim").symlink_to((ROOT / "isaacsim").resolve(), target_is_directory=True)

@@ -3,7 +3,7 @@
 # compare it, paired seed by seed, against the 040000 baseline that is already
 # on disk.
 #
-# Usage: bash run_r5g.sh <checkpoint-dir|auto> [output-dir]
+# Usage: bash scripts/experiments/r5/run_r5g.sh <checkpoint-dir|auto> [output-dir]
 #   <checkpoint-dir>  .../checkpoints/NNNNNN/pretrained_model
 #   auto              wait for the r5f training run to finish, then use its
 #                     checkpoints/last

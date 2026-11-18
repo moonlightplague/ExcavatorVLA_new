@@ -3,11 +3,14 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 from act_stall_recovery import PostDigStallDetector, settings_dict, mode_settings
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 REVIEWED = [1, 2, 4, 9, 10, 15, 18, 24, 29, 31]
 
 

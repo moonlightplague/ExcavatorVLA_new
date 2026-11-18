@@ -10,6 +10,7 @@ recent*
 __pycache__/
 .agents/
 .vscode/
+.claude/
 _rl_staging/
 
 # Generated checkpoints, runtime logs, and local development artifacts

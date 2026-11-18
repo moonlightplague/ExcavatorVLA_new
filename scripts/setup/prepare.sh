@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
+
 ISAAC_DIR="/root/gpufree-data/isaacsim/"
 MODEL_DIR="/root/gpufree-data/models/"
 

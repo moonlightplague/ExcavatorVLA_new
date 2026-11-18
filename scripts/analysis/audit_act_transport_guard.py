@@ -3,8 +3,11 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from act_carry_guard import CarryAttitudeGuard, CarryGuardSettings
 from excavator_reachability import AuthoredExcavatorChain, restored_truck_geometry
@@ -46,7 +49,7 @@ def main():
         warning='Projected actions do not change subsequent recorded states. Late unsafe states may be infeasible '
                 'even if an actual earlier intervention would have prevented reaching them.',
         files_sha256={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in
-            [args.catalog,args.model,Path(__file__),Path(__file__).parent/'act_carry_guard.py']},cases=result)
+            [args.catalog,args.model,Path(__file__),Path(__file__).resolve().parents[1] / 'act_carry_guard.py']},cases=result)
     args.output.write_text(json.dumps(payload,ensure_ascii=False,indent=2)+'\n')
     for r in result:print(r['scene_seed'],'first intervention',r['first_intervention'],'recorded empty',r['recorded_empty_step'])
 

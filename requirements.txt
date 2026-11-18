@@ -4,3 +4,5 @@ imageio
 imageio-ffmpeg
 lerobot[smolvla]==0.4.4
 PyYAML>=6.0
+matplotlib==3.10.7
+scipy==1.16.2

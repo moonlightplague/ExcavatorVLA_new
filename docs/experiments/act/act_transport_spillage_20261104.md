@@ -48,4 +48,4 @@
 
 主目录：`outputs/experiments/act_spillage_four_rounds_20261104_01/`。`REPORT.md`并列原终点和观察后计数，`transport_summary.json`保留完整分段结果，`final_transport_analysis.py`及哈希固定最终分析口径；每轮目录保存实际配置、动作、视频、物理审计和冻结源码。`transport_protocol.json`与各次修订记录保留选择和预算来源，`status.json`记录14条运输对照、6条封存探索均已完成。
 
-入口为`scripts/run_act_spillage_round.py --transport`、`scripts/act_transport_diagnostics.py`、`scripts/audit_act_transport_guard.py`、`scripts/summarize_act_transport_experiment.py`。运行产物和视频是本次研究交付，保留；单元测试临时数据自动清理，未创建训练检查点。输出、模型和缓存已有gitignore覆盖。
+入口为`scripts/run_act_spillage_round.py --transport`、`scripts/act_transport_diagnostics.py`、`scripts/analysis/audit_act_transport_guard.py`、`scripts/analysis/summarize_act_transport_experiment.py`。运行产物和视频是本次研究交付，保留；单元测试临时数据自动清理，未创建训练检查点。输出、模型和缓存已有gitignore覆盖。

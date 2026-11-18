@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'scripts'))
-from assess_act_unload_regression import assess
+from analysis.assess_act_unload_regression import assess
 
 
 class RegressionAssessmentTests(unittest.TestCase):

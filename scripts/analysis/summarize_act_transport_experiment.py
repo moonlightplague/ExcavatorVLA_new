@@ -4,6 +4,9 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import sys
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from act_transport_diagnostics import analyze_transport
 
@@ -42,7 +45,7 @@ def main():
             outcome='需结合到车与卸料轨迹核对'
         record['transport_interpretation']=outcome
         records.append(record)
-    source=Path(__file__).parent/'act_transport_diagnostics.py'
+    source=Path(__file__).resolve().parents[1] / 'act_transport_diagnostics.py'
     payload=dict(scope='development transport loss, not independent generalization or success-rate estimation',
         records=records, completed_transport_rollouts=len(records), archived_opening_rollouts=6,
         analysis_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -68,7 +71,7 @@ def main():
             f"{carry} | {empty} | {counts(terminal)} | {counts(tail)} | {progress:.2f} | {r['transport_interpretation']} |" if progress is not None else
             f"| {r['round']}/{t['scene_seed']} | {variant} | {r['horizon']} | 无 | 无 | {counts(terminal)} | {counts(tail)} | 无 | {r['transport_interpretation']} |")
     lines += ['', '每条原始视频、步骤、来源与物理审计位于对应轮次目录。末尾30步零命令观察另列于JSON，不改原终点评分；它保留积分目标，不能当成冻结机器人后的静态沉降。',
-              '', '具体结论及未通过项见仓库 `docs/act_transport_spillage_20261104.md`。']
+              '', '具体结论及未通过项见仓库 `docs/experiments/act/act_transport_spillage_20261104.md`。']
     (root/'REPORT.md').write_text('\n'.join(lines)+'\n')
     print('\n'.join(lines))
     if args.complete:

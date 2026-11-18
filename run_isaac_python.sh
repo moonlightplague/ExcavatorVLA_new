@@ -6,7 +6,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 isaac_dir="${EXCAVATOR_ISAAC_DIR:-$repo_root/isaacsim}"
 
 if [[ ! -x "$isaac_dir/python.sh" || ! -d "$isaac_dir/kit/python/lib" ]]; then
-    echo "Isaac Sim installation not found at $isaac_dir. Run preperations.sh or set EXCAVATOR_ISAAC_DIR." >&2
+    echo "Isaac Sim installation not found at $isaac_dir. Run bash scripts/setup/prepare.sh or set EXCAVATOR_ISAAC_DIR." >&2
     exit 1
 fi
 

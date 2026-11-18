@@ -261,8 +261,9 @@ def main():
     repeat_spec = None
     if args.repeat_cycles:
         supported_repeat = ((args.policy_type == 'pi05' and args.repeat_cycles == 5)
-                            or (args.policy_type == 'smolvla' and args.repeat_cycles == 10
-                                and (args.checkpoint / 'observation_history.json').is_file()
+                            or (args.policy_type in ('smolvla', 'act') and args.repeat_cycles == 10
+                                and (args.policy_type == 'act' or
+                                     (args.checkpoint / 'observation_history.json').is_file())
                                 and simulation_settings['soil_backend'] == 'newton_mpm'
                                 and os.environ.get('EXCAVATOR_MPM_COLLECTION_RUNTIME') == '1'
                                 and os.environ.get('EXCAVATOR_MPM_SOURCE_IDENTITY') ==
