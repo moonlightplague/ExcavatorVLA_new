@@ -1,0 +1,92 @@
+# Same PI05 optimizer/model/checkpoint settings as the completed PhysX run.
+# Original Newton 200-parent publication; literal SmolVLA 140/20/40 split.
+dataset:
+  repo_id: local/excavator
+  root: /root/gpufree-data/data/repeat/export_repeat
+  episodes: null
+  video_backend: pyav
+assets:
+  base_path: /root/gpufree-data/models/pi05_base
+  base_sha256: 0eb11ca9587678c1d2ef8cf32807c29f8ce53a2bfdfc1aa4a4c96f16fca59b0f
+  tokenizer_path: /root/gpufree-data/models/pi05_tokenizer
+policy:
+  type: pi05
+  device: cuda
+  dtype: bfloat16
+  n_obs_steps: 3
+  chunk_size: 10
+  n_action_steps: 3
+  max_state_dim: 32
+  max_action_dim: 32
+  image_resolution:
+  - 224
+  - 224
+  empty_cameras: 0
+  tokenizer_max_length: 512
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+  freeze_vision_encoder: true
+  train_expert_only: true
+  gradient_checkpointing: true
+  compile_model: false
+  num_inference_steps: 10
+  optimizer_lr: 2.5e-05
+  optimizer_betas:
+  - 0.9
+  - 0.95
+  optimizer_eps: 1.0e-08
+  optimizer_weight_decay: 0.01
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 40000
+  scheduler_decay_lr: 2.5e-06
+training:
+  trainable_dtype: float32
+  gradient_accumulation_steps: 4
+  validation_batch_size: 1
+  resume: null
+  keep_checkpoints: 10
+  mode: vlm_lora_expert_full
+  lora:
+    r: 16
+    alpha: 32.0
+    dropout: 0.0
+    targets:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    init_seed: 0
+  data_soil_backend: newton_mpm
+  recovery_save_freq: 100
+  validation_samples_per_episode: 8
+  backend_provenance_root: /root/gpufree-data/ExcavatorVLA_new/outputs/experiments/pi05_history_repeat20k_20261123_01/prepared/collection_backend
+steps: 20000
+batch_size: 1
+num_workers: 0
+seed: 1000
+save_freq: 2000
+log_freq: 50
+grad_clip_norm: 1.0
+job_name: excavator_pi05_history_repeat20k_newton
+output_dir: /root/gpufree-data/ExcavatorVLA_new/outputs/experiments/pi05_history_repeat20k_20261123_01/train
+benchmark:
+  split_file: /root/gpufree-data/ExcavatorVLA_new/outputs/experiments/pi05_history_repeat20k_20261123_01/prepared/split_manifest.json
+  split_seed: 1000
+  validation_freq: 2000
+  validation_max_batches: 0
+launcher:
+  output_root: /root/gpufree-data/ExcavatorVLA_new/outputs/train
+  hf_home: /root/gpufree-data/models/hf-cache
+  torch_home: /root/gpufree-data/models/torch-cache
+  gpu_ids:
+  - 0
+  - 1
+  mixed_precision: bf16
+  cpu_threads: 4
+observation_history:
+  delta_indices:
+  - -6
+  - -3
+  - 0

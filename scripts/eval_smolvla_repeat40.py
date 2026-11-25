@@ -49,22 +49,33 @@ def prepare(experiment, output, policy_type="smolvla", replan_interval=None):
             or set(test_ids) & (set(split['train']) | set(split['validation']))):
         raise ValueError('Expected 40 distinct sealed parents with no train/validation overlap')
     dataset = (BASE / 'data/repeat/export_repeat').resolve()
+    if policy_type == 'act' and (experiment / 'train/resolved_settings.json').is_file():
+        dataset = Path(read(experiment / 'train/resolved_settings.json')['dataset']['root']).resolve()
     checkpoint = experiment / ('train/checkpoints/040000/pretrained_model' if policy_type == 'act' else 'train/checkpoints/step_20000/pretrained_model')
     if policy_type == 'act':
         status = read(experiment / 'status.json')
         if status.get('phase') != 'completed' or status.get('step') != 40000:
             raise ValueError('ACT training must be completed before evaluation')
     if replan_interval is None:
-        replan_interval = 100 if policy_type == 'act' else 3
+        config_path = checkpoint / 'config.json'
+        replan_interval = (read(config_path).get('n_action_steps', 100)
+                           if policy_type == 'act' and config_path.exists()
+                           else 100 if policy_type == 'act' else 3)
     if not (checkpoint / 'model.safetensors').is_file():
         raise ValueError('The completed step_20000 checkpoint is missing')
     info = read(dataset / 'meta/info.json')
+    publication = dataset
+    if info.get('relabel', {}).get('kind') == 'newton_repeat_control_reconstruction_v1':
+        sys.path.insert(0, str(BASE / 'ExcavatorVLA-vlm'))
+        from excavator_vlm.data.control_repair import require_control_repair_gate
+        require_control_repair_gate(dataset, read(dataset / 'audit.json')['fingerprint'])
+        publication = Path(info['relabel']['source']).resolve()
     if info['fps'] != 10 or info['total_episodes'] != 200:
         raise ValueError('The repeat source publication differs from the frozen experiment')
     receipts = {}
     for path in (BASE / 'data/repeat/raw').glob('run_*/episode_*/export.json'):
         receipt = read(path)
-        if not receipt.get('validated') or Path(receipt['export_dir']).resolve() != dataset:
+        if not receipt.get('validated') or Path(receipt['export_dir']).resolve() != publication:
             continue
         eid = receipt['export_episode_index']
         if eid in receipts:
@@ -146,7 +157,9 @@ def prepare(experiment, output, policy_type="smolvla", replan_interval=None):
                                    'completed model failures are never replaced or retried.')
     if policy_type == 'act':
         manifest.update(policy_type='act', checkpoint_step=40000)
-        manifest['scope'] = manifest['scope'].replace('continuous history', 'current observation, predict 100 actions, execute ' + str(replan_interval))
+        action_chunk_size = read(checkpoint / 'config.json').get('chunk_size', 100)
+        manifest['scope'] = manifest['scope'].replace('continuous history',
+            f'current observation, predict {action_chunk_size} actions, execute {replan_interval}')
     path = output / 'manifest.json'
     if path.exists() and read(path) != manifest:
         raise ValueError('Evaluation manifest differs from the existing output')

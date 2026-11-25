@@ -65,8 +65,9 @@ def load_settings(path, run_output=None):
     if history is not None:
         from prepare_smolvla_history import resolve_dataset
         from smolvla_history import history_spec
-        if not isinstance(history, dict) or set(history) != {'delta_indices'}:
-            raise ValueError('observation_history must specify delta_indices')
+        if (not isinstance(history, dict) or 'delta_indices' not in history
+                or set(history) - {'delta_indices', 'state_history'}):
+            raise ValueError('observation_history needs delta_indices and optional state_history')
         if settings['policy'].get('n_obs_steps') != 3 or not prepared:
             raise ValueError('History training needs n_obs_steps=3 and prepared_data')
         prepared = resolve_path(prepared, path.parent)
@@ -75,7 +76,8 @@ def load_settings(path, run_output=None):
             raise ValueError('Requested episodes differ from the frozen history training split')
         settings['dataset']['root'] = str(resolve_dataset(settings['dataset']['root']))
         settings['dataset']['episodes'] = split['train']
-        launcher.update(observation_history=history_spec(history['delta_indices']),
+        launcher.update(observation_history=history_spec(history['delta_indices'],
+                        state_history=history.get('state_history', False)),
                         prepared_data=str(prepared), micro_batch_size=micro_batch)
     elif settings['policy'].get('n_obs_steps', 1) != 1:
         raise ValueError('Multi-timestamp SmolVLA requires an explicit causal history contract')
@@ -138,7 +140,7 @@ def build_train_config(settings):
     return cfg
 
 
-def install_trainer_adapters(trainer, cfg, history=None, stats=None):
+def install_trainer_adapters(trainer, cfg, history=None, stats=None, provenance=None):
     """Keep compatibility changes local to this process, not site-packages."""
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
@@ -170,6 +172,8 @@ def install_trainer_adapters(trainer, cfg, history=None, stats=None):
         if history is not None:
             from smolvla_history import bind_history, load_policy, MANIFEST
             bind_history(cfg.policy, history)
+            if provenance is not None:
+                cfg.policy.excavator_training_provenance = copy.deepcopy(provenance)
             checkpoint = Path(cfg.policy.pretrained_path)
             return load_policy(checkpoint, config=cfg.policy,
                 initial_base=not (checkpoint / MANIFEST).exists() and not cfg.resume)
@@ -317,6 +321,13 @@ def run_training(cfg, launcher, config_path):
             (cfg.output_dir / 'resolved_training_config.json').write_text(
                 json.dumps({'launcher': launcher, 'training': cfg.to_dict()}, indent=2) + '\n',
             )
+            (cfg.output_dir / 'training_runtime.json').write_text(json.dumps({
+                'world_size': accelerator.num_processes, 'batch_per_gpu': cfg.batch_size,
+                'gradient_accumulation_steps': accelerator.gradient_accumulation_steps,
+                'global_effective_batch': cfg.batch_size * accelerator.num_processes
+                    * accelerator.gradient_accumulation_steps,
+                'history': launcher.get('observation_history'),
+            }, indent=2) + '\n')
         accelerator.wait_for_everyone()
 
     cfg.validate = validate_and_record
@@ -359,7 +370,20 @@ def run_training(cfg, launcher, config_path):
             return result
 
         trainer.update_policy = update_and_record
-    install_trainer_adapters(trainer, cfg, history, stats)
+    provenance = None
+    if history is not None and (prepared / 'training_provenance.json').is_file():
+        from excavator_vlm.data.contract import file_hash
+        from excavator_vlm.data.control_repair import require_control_repair_gate
+        from excavator_vlm.data.action_limits import action_contract
+        provenance = json.loads((prepared / 'training_provenance.json').read_text())
+        info = json.loads((Path(cfg.dataset.root) / 'meta/info.json').read_text())
+        if (provenance['normalization_stats_sha256'] != file_hash(prepared / 'normalization_stats.json')
+                or provenance['split_sha256'] != file_hash(prepared / 'split_manifest.json')
+                or provenance['action_contract'] != action_contract(info)
+                or provenance['dataset'] != str(Path(cfg.dataset.root).resolve())):
+            raise ValueError('Prepared training provenance differs from the requested data/statistics')
+        require_control_repair_gate(cfg.dataset.root, provenance['dataset_fingerprint'])
+    install_trainer_adapters(trainer, cfg, history, stats, provenance)
     trainer.train(cfg, accelerator)
     if accelerator.is_main_process:
         if history is not None:

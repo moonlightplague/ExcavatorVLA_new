@@ -1,0 +1,8 @@
+# Isolate executable control labels from changes to architecture/history/loss.
+extends: training_config_act_shortchunk.yaml
+dataset:
+  root: outputs/experiments/act_repeat_control_repair_data_20261118_01/dataset
+job_name: excavator_act_repaired_repeat40k
+output_dir: outputs/experiments/act_repaired_repeat40k_20261118_01/train
+benchmark:
+  split_file: outputs/experiments/act_repaired_repeat40k_20261118_01/prepared/split_manifest.json

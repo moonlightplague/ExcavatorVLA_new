@@ -102,10 +102,17 @@ def load_mass_repeat_spec(dataset, reference, cycles, cycle_steps, strict_minimu
     meta = read(provenance['source_meta'])
     receipt = read(provenance['source_receipt'])
     gate = read(provenance['source_quality_gate'])
+    publication = Path(dataset).resolve()
+    candidate_info = read(publication / 'meta/info.json')
+    if candidate_info.get('relabel', {}).get('kind') == 'newton_repeat_control_reconstruction_v1':
+        from excavator_vlm.data.control_repair import require_control_repair_gate
+        candidate_audit = read(publication / 'audit.json')
+        require_control_repair_gate(publication, candidate_audit['fingerprint'])
+        publication = Path(candidate_info['relabel']['source']).resolve()
     if (cycles != 10 or not receipt.get('validated') or not meta.get('success')
             or receipt['export_episode_index'] != provenance['source_export_episode']
             or receipt['episode_id'] != meta['episode_id']
-            or Path(receipt['export_dir']).resolve() != Path(dataset).resolve()
+            or Path(receipt['export_dir']).resolve() != publication
             or meta['scoops_completed'] != cycles or len(meta['repeat_cycles']) != cycles):
         raise ValueError('Ten-cycle scene is not a complete validated source parent')
     baseline = meta['repeat_baseline']
@@ -338,22 +345,34 @@ def audit_repeat_trace(folder, spec, expected):
     initial = read(folder / 'initial_observation.json')
     machine = make_repeated_task(spec, {'evaluation_particle_ids': initial['evaluation_particle_ids']}, started_wall=0.)
     rows = [json.loads(line) for line in (folder / 'steps.jsonl').read_text().splitlines()]
+    scoring_steps = expected.get('repeat_scoring_steps', len(rows))
+    if type(scoring_steps) is not int or not 0 < scoring_steps <= len(rows):
+        raise ValueError('Invalid repeated-task scoring boundary')
+    if scoring_steps < len(rows) and not expected.get('run_full_step_budget'):
+        raise ValueError('Unrequested continuation after task scoring')
     heading_origin = initial['observation_context']['initial_heading_rad']
     history = read(folder.parent.parent / 'config.json').get('observation_history', {}).get('delta_indices', [0])
     for step, row in enumerate(rows):
-        if row['step'] != step or row['repeat_cycle_index'] != len(machine.cycles):
+        tail = step >= scoring_steps
+        cycle_index = min(len(machine.cycles), spec['cycles']-1)
+        if row['step'] != step or row['repeat_cycle_index'] != cycle_index:
             raise ValueError('Trace has a discontinuous repeated-task cycle/step sequence')
         if row.get('action_source') != 'model' or (len(history) > 1 and (
                 row.get('input_history_steps') != [max(0, step + offset) for offset in history]
                 or row.get('input_history_is_pad') != [step + offset < 0 for offset in history])):
             raise ValueError('Repeated trace has an expert action or reset/skipped policy history')
-        goal = spec['goals'][len(machine.cycles)]
+        goal = spec['goals'][cycle_index]
         heading = heading_origin + row['state'][0]
         landmarks = row['bucket_landmarks_world']
         wanted = [*point_delta_in_heading_frame(goal['dig_target_xyz'], landmarks['tip'], heading),
                   *point_delta_in_heading_frame(goal['unload_landing_xyz'], landmarks['load'], heading)]
         if not np.allclose(wanted, row['state'][18:24], atol=2e-5, rtol=0):
             raise ValueError('Trace task-goal geometry differs from the active repeated task')
+        if tail:
+            if (not machine.finished or len(machine.cycles) != spec['cycles']
+                    or row.get('repeat_scoring_active') is not False):
+                raise ValueError('Invalid model-only continuation after task scoring')
+            continue
         reply = {'evaluation_particle_ids': row['evaluation_particle_ids'],
                  'observation_state_28d': row['state'],
                  'bucket_landmarks_world': row['bucket_landmarks_world'],
@@ -361,7 +380,7 @@ def audit_repeat_trace(folder, spec, expected):
         event = machine.observe(reply, step, step / spec['fps'])
         if event == 'next_cycle':
             machine.advance(reply, step / spec['fps'])
-        elif event == 'finished' and step != len(rows) - 1:
+        elif event == 'finished' and step != scoring_steps - 1:
             raise ValueError('Trace continued after repeated task termination')
     actual = machine.result(final=True, wall=len(rows) / spec['fps'])
     for key in ('repeat_cycles_completed', 'repeat_returns_completed', 'repeat_collection_success', 'repeat_strict_success'):
@@ -391,7 +410,9 @@ def audit_repeat_trace(folder, spec, expected):
                 or event['camera_sha256'] != rows[cycle['end_step']]['camera_sha256']
                 or event['joint_command_positions'] != rows[cycle['end_step']]['joint_command_positions']):
             raise ValueError('Goal transition changed physical state or used an invalid cycle boundary')
-    return {'status': 'passed', 'steps': len(rows), 'cycles_completed': actual['repeat_cycles_completed'],
+    return {'status': 'passed', 'steps': len(rows), 'scoring_steps': scoring_steps,
+            'model_only_continuation_steps': len(rows)-scoring_steps,
+            'cycles_completed': actual['repeat_cycles_completed'],
             'check': 'independent event/ID/return reconstruction and active task-goal geometry'}
 
 

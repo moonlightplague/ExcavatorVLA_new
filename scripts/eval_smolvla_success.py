@@ -20,6 +20,7 @@ from lerobot.policies.factory import get_policy_class
 
 BASE = Path(__file__).resolve().parents[1]
 REPO = BASE / 'ExcavatorVLA-smolvla'
+sys.path.insert(0, str(BASE / 'ExcavatorVLA-vlm'))
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / 'scripts/evaluation'))
 from excavator_common.bridge_protocol import read_json, write_json, decode_camera_images
@@ -126,6 +127,10 @@ def main():
     parser.add_argument('--min-particles', type=int, default=100)
     parser.add_argument('--seed', type=int, default=2)
     parser.add_argument('--replan-interval', type=int, default=3)
+    parser.add_argument('--run-full-step-budget', action='store_true',
+                        help='Execute every requested step; after ten task cycles keep the final goal and continue model actions, scoring the ten-cycle task at its completion.')
+    parser.add_argument('--allow-tighter-action-transfer', action='store_true',
+                        help='PI05 diagnostic only: preserve checkpoint decoding and clip to a tighter scene action profile; record the cross-domain transfer.')
     parser.add_argument('--repeat-cycles', type=int, choices=(0, 5, 10), default=0,
                         help='Recorded-goal repeated task; every motion remains model-controlled')
     parser.add_argument('--repeat-cycle-steps', type=int, default=500,
@@ -173,6 +178,8 @@ def main():
     parser.add_argument('--gpus', help='Physical GPU indices or UUIDs, e.g. 0,1; respects CUDA_VISIBLE_DEVICES.')
     parser.add_argument('--headless', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--video', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--preview-steps', type=int, default=0,
+                        help='Also close an early playable preview after this many actions; full evaluation/video continue.')
     parser.add_argument('--save-trajectory', action=argparse.BooleanOptionalAction, default=False,
                         help='Also write episodes/*/trajectory with the lossless per-step frames, states, '
                              'actions and particle counts, so scored rollouts can be reused for Best-of-N '
@@ -194,8 +201,14 @@ def main():
     parser.add_argument('--worker-count', type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument('--gpu-label', default='', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.run_full_step_budget and args.repeat_cycles != 10:
+        parser.error('--run-full-step-budget requires the ten-cycle task')
+    if args.allow_tighter_action_transfer and args.policy_type != 'pi05':
+        parser.error('--allow-tighter-action-transfer is a PI05 diagnostic option')
     if min(args.episodes, args.steps, args.min_particles, args.replan_interval) < 1:
         parser.error('Episode, step, particle and replanning counts must be positive')
+    if not 0 <= args.preview_steps <= args.steps or (args.preview_steps and not args.video):
+        parser.error('--preview-steps requires video and must be between 0 and --steps')
     if (args.act_temporal_window < 0 or not np.isfinite(args.act_temporal_decay)
             or args.act_temporal_decay < 0):
         parser.error('ACT temporal window/decay must be nonnegative and decay finite')
@@ -239,11 +252,17 @@ def main():
     if not args.checkpoint.is_dir():
         parser.error(f'Checkpoint directory does not exist: {args.checkpoint}')
     info = json.loads((args.dataset / 'meta/info.json').read_text())
-    if args.policy_type == 'pi05':
+    action_transfer = None
+    if args.policy_type in ('pi05', 'act'):
         from excavator_vlm.data.action_limits import action_contract, check_checkpoint_contract
         action_contract(info)
         if not args.replay_reference:
-            check_checkpoint_contract(json.loads((args.checkpoint / 'checkpoint.json').read_text()), info)
+            manifest_name = 'checkpoint.json' if args.policy_type == 'pi05' else 'benchmark_provenance.json'
+            manifest_path = args.checkpoint / manifest_name
+            from evaluation_action_transfer import validate_action_transfer
+            action_transfer = validate_action_transfer(
+                json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}, info,
+                allow_tighter=args.allow_tighter_action_transfer)
     if args.replay_reference and args.reference_episode is None:
         parser.error('--replay-reference requires --reference-episode')
     reference = reference_episode(args.reference_episode, info['fps']) if args.reference_episode else None
@@ -261,8 +280,8 @@ def main():
     repeat_spec = None
     if args.repeat_cycles:
         supported_repeat = ((args.policy_type == 'pi05' and args.repeat_cycles == 5)
-                            or (args.policy_type in ('smolvla', 'act') and args.repeat_cycles == 10
-                                and (args.policy_type == 'act' or
+                            or (args.policy_type in ('smolvla', 'act', 'pi05') and args.repeat_cycles == 10
+                                and (args.policy_type in ('act', 'pi05') or
                                      (args.checkpoint / 'observation_history.json').is_file())
                                 and simulation_settings['soil_backend'] == 'newton_mpm'
                                 and os.environ.get('EXCAVATOR_MPM_COLLECTION_RUNTIME') == '1'
@@ -303,6 +322,9 @@ def main():
                   initial_joints_deg=initial_pose, execution_source='expert_replay' if args.replay_reference else 'model')
     config['action_limits_rad_s'] = action_limits.tolist()
     config['action_limit_profile'] = info.get('action_limit_profile', 'excavator_velocity_v1')
+    config['action_transfer'] = action_transfer
+    config['success_scope'] = ('First ten physical task cycles; model-only continuation retains the final task goal until the full step budget.'
+                               if args.run_full_step_budget else 'Task completion or step limit')
     config['replay_scope'] = 'full_reference' if args.replay_full_reference else 'single_cycle'
     if args.act_carry_guard:
         config.update(supervisor=True, execution_source='model_with_carry_guard',
@@ -371,6 +393,8 @@ def main():
         protocol.update(action_limits_rad_s=config['action_limits_rad_s'],
                         action_limit_profile=config['action_limit_profile'])
         protocol['replay_scope'] = config['replay_scope']
+        protocol.update(run_full_step_budget=args.run_full_step_budget, action_transfer=action_transfer,
+                        success_scope=config['success_scope'])
         if repeat_spec is not None:
             protocol['repeat_spec'] = repeat_spec
         if 'observation_history' in config:
@@ -546,6 +570,7 @@ def run_episodes(args, info, reference, action_limits, policy,
         status.update(policy_type=getattr(args, 'policy_type', 'smolvla'),
                       checkpoint_step=config.get('checkpoint_step'),
                       clipped_action_dimensions=0, applied_action_dimensions=0)
+        status.update(run_full_step_budget=getattr(args, 'run_full_step_budget', False), step_budget=args.steps)
         status.update(act_temporal_window=temporal_window,
                       act_temporal_decay=temporal_decay if temporal_window else None)
         status.update(act_carry_guard=getattr(args, 'act_carry_guard', False), carry_guard_modified_steps=0)
@@ -585,6 +610,9 @@ def run_episodes(args, info, reference, action_limits, policy,
         video = (EpisodeVideo(folder / 'evaluation.mp4', index, status['scene_seed'],
                               info['fps'], args.steps, args.min_particles) if args.video else None)
         status['video_path'] = str(video.path) if video is not None else None
+        preview_steps = getattr(args, 'preview_steps', 0)
+        preview = (EpisodeVideo(folder/'preview.mp4', index, status['scene_seed'],info['fps'],args.steps,args.min_particles)
+                   if video is not None and preview_steps else None)
         store = (trajectory_store(folder, info['fps'], status['scene_seed'], provenance={
                      'evaluation_id': config['evaluation_id'],
                      'checkpoint_sha256': config['checkpoint_sha256'],
@@ -664,6 +692,8 @@ def run_episodes(args, info, reference, action_limits, policy,
                 if video is not None:
                     video.write(reply, {**status, 'status': 'running',
                                         'final_bucket_open': float(reply['joint_positions'][3]) >= -0.80})
+                    if preview is not None:
+                        preview.append(video.render({**status, 'preview_only':True}))
                 if policy is not None:
                     policy.reset()
                 observation_history = None
@@ -698,7 +728,8 @@ def run_episodes(args, info, reference, action_limits, policy,
                     policy_latency_ms = None
                     # Validate every returned observation, including between replans.
                     state_pre = validate_state(reply)
-                    repeat_cycle_index = len(repeated.cycles) if repeated is not None else None
+                    repeat_cycle_index = (min(len(repeated.cycles), repeat_spec['cycles']-1) if repeated is not None else None)
+                    repeat_scoring_active = repeated is not None and not repeated.finished
                     if observation_history is not None:
                         observation_history.append(policy_batch(frames, state_pre, reply['task_text']), step)
                     input_state = state_pre.tolist()
@@ -766,8 +797,12 @@ def run_episodes(args, info, reference, action_limits, policy,
                     elapsed = time.monotonic() - policy_start
                     repeat_event = None
                     if repeated is not None:
-                        repeat_event = repeated.observe(reply, step, time.monotonic())
+                        if repeat_scoring_active:
+                            repeat_event = repeated.observe(reply, step, time.monotonic())
+                            if repeat_event == 'finished':
+                                status['repeat_scoring_steps'] = step+1
                         status.update(repeated.result())
+                        status['live_payload_mass_kg'] = count*repeat_spec.get('metric_point_mass_kg', 0.)
                         success = status['repeat_collection_success']
                         stable_steps = repeated.dump_consecutive
                     else:
@@ -807,6 +842,7 @@ def run_episodes(args, info, reference, action_limits, policy,
                                             'bucket_position': bucket_q, 'bridge_timing': reply['bridge_timing'],
                                             'particle_transfer_metrics': reply['particle_transfer_metrics'],
                                             **({'repeat_cycle_index': repeat_cycle_index,
+                                                'repeat_scoring_active': repeat_scoring_active,
                                                 'evaluation_particle_ids': reply['evaluation_particle_ids'],
                                                 'repeat_bucket_particles': reply['bucket_load_metrics']['count'],
                                                 'bucket_landmarks_world': reply['bucket_landmarks_world'],
@@ -822,6 +858,14 @@ def run_episodes(args, info, reference, action_limits, policy,
                     trace.flush()
                     if video is not None:
                         video.write(reply, {**status, 'status': 'running'}, stable_steps)
+                        if preview is not None and preview.frame_count <= preview_steps:
+                            preview.append(video.render({**status, 'preview_only':True}))
+                            if preview.frame_count == preview_steps+1:
+                                preview.close_stream()
+                                status['preview_video_path'] = str(preview.path)
+                                atomic_json(folder/'preview_status.json',dict(status='ready',preview_actions=step+1,
+                                    scope='First observations of an ongoing fixed-budget rollout, not a final task result.',
+                                    video_path=str(preview.path)))
                         if repeated is not None and os.environ.get('EXCAVATOR_EVAL_MATERIAL_SNAPSHOTS') == '1':
                             snapshot = ('before_unload' if getattr(repeated, 'carry_step', None) == step else
                                         'after_unload' if repeated.dump_step is not None and step == repeated.dump_step+10 else None)
@@ -831,9 +875,11 @@ def run_episodes(args, info, reference, action_limits, policy,
                     frames = post_action_frames
                     if repeated is not None:
                         if repeat_event == 'finished':
-                            status.update(early_terminated=True, termination_reason='repeat_task_completed'
-                                if success else repeated.failure_reason)
-                            break
+                            if not getattr(args, 'run_full_step_budget', False):
+                                status.update(early_terminated=True, termination_reason='repeat_task_completed'
+                                    if success else repeated.failure_reason)
+                                break
+                            status['repeat_task_completion_step'] = step+1
                         if repeat_event == 'next_cycle':
                             goal = repeat_spec['goals'][len(repeated.cycles)]
                             command = {'type': 'set_task_goals', 'revision': len(repeated.cycles), **goal}
@@ -863,6 +909,9 @@ def run_episodes(args, info, reference, action_limits, policy,
                     if status['full_reference_executed']:
                         status['termination_reason'] = 'full_reference_finished'
                 status.setdefault('termination_reason', 'step_limit')
+                status['full_step_budget_completed'] = status['policy_steps_executed'] == args.steps
+                if getattr(args, 'run_full_step_budget', False) and status['full_step_budget_completed']:
+                    status['termination_reason'] = 'full_step_budget'
                 (folder / 'rollout_validation.json').write_text(json.dumps({
                     'status': 'passed', 'pure_model_execution_validated': config['execution_source'] == 'model',
                     'execution_source': config['execution_source'],
@@ -924,6 +973,8 @@ def run_episodes(args, info, reference, action_limits, policy,
                     status.update(status='error', error=status['video_error'])
                     print(f"Episode {index} video error: {status['video_error']}", flush=True)
                     failed = True
+            if preview is not None:
+                preview.close_stream()
             if status['status'] != 'completed':
                 status.update(cycle_time_seconds=None, cycle_time_wall_seconds=None,
                               observed_completion_before_error=bool(status['success']),

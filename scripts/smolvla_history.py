@@ -1,4 +1,4 @@
-"""Local SmolVLA causal visual history; pretrained modules and action space are unchanged."""
+"""Versioned causal SmolVLA image/state history, including legacy image-only models."""
 import copy
 import json
 from pathlib import Path
@@ -15,19 +15,29 @@ from excavator_vlm.policies.pi05.history import (
 )
 
 VERSION = 'excavator_smolvla_visual_history_v1'
+STATE_HISTORY_VERSION = 'excavator_smolvla_visual_state_history_v2'
 MANIFEST = 'observation_history.json'
+PROVENANCE = 'benchmark_provenance.json'
 
 
-def history_spec(indices=(-6, -3, 0)):
+def history_spec(indices=(-6, -3, 0), *, state_history=False):
     sampling = make_history(indices)
     if len(indices) != 3:
         raise ValueError('SmolVLA visual history requires exactly three causal timestamps')
-    return {**sampling, 'version': VERSION, 'state_encoding': 'current_normalized_vector',
+    spec = {**sampling, 'version': VERSION, 'state_encoding': 'current_normalized_vector',
             'action_alignment': 'current_observation_then_actions_0_to_H_minus_1'}
+    if type(state_history) is not bool:
+        raise ValueError('state_history must be boolean')
+    if state_history:
+        spec.update(version=STATE_HISTORY_VERSION, state_encoding='causal_normalized_vectors_concat',
+                    state_dim_per_frame=28, padded_state_dim_per_frame=32,
+                    state_projection_input_dim=96, state_padding='zero_after_normalization')
+    return spec
 
 
 def validate_history(spec):
-    if not isinstance(spec, dict) or spec != history_spec(spec.get('delta_indices', [])):
+    if not isinstance(spec, dict) or spec != history_spec(spec.get('delta_indices', []),
+            state_history=spec.get('version') == STATE_HISTORY_VERSION):
         raise ValueError('Invalid or incompatible SmolVLA history manifest')
     return copy.deepcopy(spec)
 
@@ -37,8 +47,30 @@ def bind_history(config, spec):
         raise ValueError('History checkpoint requires n_obs_steps=3')
     if tuple(config.image_features) != CAMERAS or config.empty_cameras:
         raise ValueError('History needs exactly canonical cameras 0, 1, 2')
+    if spec.get('version') == STATE_HISTORY_VERSION and config.max_state_dim != 32:
+        raise ValueError('State history preserves the pretrained per-frame 32D state interface')
     config.excavator_observation_history = validate_history(spec)
     return config
+
+
+def expand_state_projection(policy):
+    """Initialize past slots to zero and retain the pretrained current-state projection."""
+    old = policy.model.state_proj
+    if old.in_features != 32:
+        raise ValueError('Base state projection must accept 32 features')
+    # Construct on CPU and restore RNG: this structural change must not perturb sampling.
+    with torch.random.fork_rng(devices=[]):
+        new = torch.nn.Linear(96, old.out_features, bias=old.bias is not None).to(
+            device=old.weight.device, dtype=old.weight.dtype)
+    with torch.no_grad():
+        new.weight.zero_()
+        new.weight[:, -32:].copy_(old.weight)
+        if old.bias is not None:
+            new.bias.copy_(old.bias)
+    new.weight.requires_grad_(old.weight.requires_grad)
+    if old.bias is not None:
+        new.bias.requires_grad_(old.bias.requires_grad)
+    policy.model.state_proj = new
 
 
 class ObservationHistory(PI05ObservationHistory):
@@ -99,9 +131,19 @@ def policy_class():
             self.history = validate_history(config.excavator_observation_history)
             bind_history(config, self.history)
             super().__init__(config, **kwargs)
+            if self.history['version'] == STATE_HISTORY_VERSION:
+                expand_state_projection(self)
 
         def prepare_images(self, batch):
             return temporal_images(batch, self.history, super().prepare_images)
+
+        def prepare_state(self, batch):
+            if self.history['version'] == VERSION:
+                return super().prepare_state(batch)
+            mask = window_mask(batch, self.history)
+            state = torch.nn.functional.pad(batch['observation.state'], (0, 4))
+            state = state.masked_fill(mask.to(state.device).unsqueeze(-1), 0)
+            return state.flatten(1)
 
         def forward(self, batch, noise=None, time=None, reduction='mean'):
             from train_smolvla import excavator_forward
@@ -117,6 +159,9 @@ def policy_class():
         def _save_pretrained(self, save_directory):
             super()._save_pretrained(save_directory)
             (Path(save_directory) / MANIFEST).write_text(json.dumps(self.history, indent=2) + '\n')
+            provenance = getattr(self.config, 'excavator_training_provenance', None)
+            if provenance is not None:
+                (Path(save_directory) / PROVENANCE).write_text(json.dumps(provenance, indent=2) + '\n')
             assets = Path(save_directory) / 'backbone_assets'
             self.model.vlm_with_expert.processor.save_pretrained(assets)
             self.model.vlm_with_expert.vlm.config.save_pretrained(assets)
@@ -141,13 +186,27 @@ def load_policy(checkpoint, config=None, *, initial_base=False, device=None):
         requested = getattr(config, 'excavator_observation_history', spec)
         if requested != spec:
             raise ValueError('Resume/loading cannot change temporal sampling')
-    bind_history(config, spec)
+    provenance_path = checkpoint / PROVENANCE
+    if provenance_path.is_file():
+        provenance = json.loads(provenance_path.read_text())
+        requested = getattr(config, 'excavator_training_provenance', provenance)
+        if requested != provenance:
+            raise ValueError('Resume/loading cannot change training provenance or action contract')
+        config.excavator_training_provenance = provenance
+    # Base weights contain a 32D projection. Load them strictly before adding past-state slots.
+    upgrading = initial_base and spec['version'] == STATE_HISTORY_VERSION
+    bind_history(config, history_spec(spec['delta_indices']) if upgrading else spec)
     if device is not None:
         config.device = str(device)
     config.load_vlm_weights = False
     if (checkpoint / 'backbone_assets/config.json').is_file():
         config.vlm_model_name = str(checkpoint / 'backbone_assets')
-    return policy_class().from_pretrained(checkpoint, config=config, strict=True, local_files_only=True)
+    policy = policy_class().from_pretrained(checkpoint, config=config, strict=True, local_files_only=True)
+    if upgrading:
+        bind_history(config, spec)
+        policy.history = validate_history(spec)
+        expand_state_projection(policy)
+    return policy
 
 
 def load_history(checkpoint, device='cpu'):

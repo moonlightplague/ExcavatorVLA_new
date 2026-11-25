@@ -12,6 +12,7 @@ __pycache__/
 .vscode/
 .claude/
 _rl_staging/
+slides/
 
 # Generated checkpoints, runtime logs, and local development artifacts
 /checkpoints/

@@ -60,13 +60,15 @@ class EpisodeVideo:
                         + (f"Passed {status['repeat_cycles_successful']}  |  " if 'repeat_cycles_successful' in status else '') +
                         f"{status.get('repeat_phase', '')}  |  "
                         f"Min {status['repeat_minimum_per_cycle_kg']:g} kg/cycle  |  "
-                        f"Truck {status.get('repeat_final_payload_mass_kg', 0):.1f} kg")
+                        f"Truck {status.get('live_payload_mass_kg', status.get('repeat_final_payload_mass_kg', 0)):.1f} kg")
         else:
             line = (f'Deposited {count}/{self.min_particles} particles  |  '
                     f'Completion observations {self.stable_steps}/3  |  Bucket {bucket}')
         draw.text((12, 802), line, font=self.font, fill='white')
         if not final:
             result, color = 'RUNNING', (100, 190, 255)
+            if status.get('preview_only'):
+                result = 'PREVIEW - FULL EVALUATION RUNNING'
         elif status.get('error') or status.get('status') == 'error':
             result, color = f"ERROR: {status.get('error') or 'Evaluation failed'}", (255, 130, 100)
         elif status.get('repeat_cycles_target'):
@@ -124,3 +126,8 @@ class EpisodeVideo:
 
     def snapshot(self, status, path):
         Image.fromarray(self.render(status)).save(path)
+
+    def close_stream(self):
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None

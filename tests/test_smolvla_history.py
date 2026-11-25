@@ -11,7 +11,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'scripts'), str(ROOT / 'ExcavatorVLA-smolvla')]
 from smolvla_history import (CAMERAS, MASK, ObservationHistory, configure_dataset, history_spec, inference_batch,
-    policy_batch, policy_class, validate_history)
+    policy_batch, policy_class, validate_history, expand_state_projection)
 from train_smolvla import microbatch_update
 
 
@@ -115,6 +115,38 @@ class NativeSmolVLAProcessingTests(unittest.TestCase):
         self.assertEqual(action.shape,(1,10,32))
         torch.testing.assert_close(action[:,:,:4],batch['action'])
         self.assertEqual(action[:,:,4:].abs().sum().item(),0)
+
+    def test_state_history_uses_ordered_slots_and_ignores_padded_values(self):
+        policy=self.policy();policy.history=history_spec(state_history=True)
+        batch=self.batch()
+        state=policy.prepare_state(batch).reshape(1,3,32)
+        torch.testing.assert_close(state[:,:,:28],batch['observation.state'])
+        self.assertEqual(state[:,:,28:].abs().sum().item(),0)
+        batch[MASK][0,:2]=True
+        expected=policy.prepare_state(batch)
+        batch['observation.state'][:,:2]=1234
+        torch.testing.assert_close(policy.prepare_state(batch),expected,rtol=0,atol=0)
+        self.assertEqual(expected[:,:64].abs().sum().item(),0)
+        self.assertEqual(validate_history(policy.history),policy.history)
+
+    def test_expansion_preserves_base_and_past_state_weights_receive_gradient(self):
+        policy=self.policy();policy.model=torch.nn.Module()
+        policy.model.state_proj=torch.nn.Linear(32,8)
+        policy.history=history_spec(state_history=True)
+        batch=self.batch();batch['observation.state'][:,0]=.5
+        inputs=policy.prepare_state(batch)
+        expected=policy.model.state_proj(inputs[:,-32:]).detach()
+        rng=torch.random.get_rng_state().clone()
+        expand_state_projection(policy)
+        self.assertTrue(torch.equal(rng,torch.random.get_rng_state()))
+        torch.testing.assert_close(policy.model.state_proj(inputs),expected,rtol=1e-6,atol=1e-6)
+        policy.model.state_proj(inputs).sum().backward()
+        self.assertGreater(policy.model.state_proj.weight.grad[:,:64].abs().sum().item(),0)
+        with torch.no_grad():policy.model.state_proj.weight-=.01*policy.model.state_proj.weight.grad
+        original=policy.model.state_proj(inputs).detach()
+        batch['observation.state'][:,0]+=1
+        changed=policy.model.state_proj(policy.prepare_state(batch)).detach()
+        self.assertGreater((original-changed).abs().max().item(),0)
 
 
 class LogicalBatchTests(unittest.TestCase):

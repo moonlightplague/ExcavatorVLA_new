@@ -142,6 +142,9 @@ class PhysicalCycleTests(unittest.TestCase):
             truck = truck+ids if success else truck
             scripted += [observation(tip=(7.,0.,4.),truck=truck)]*3
             scripted += [observation(tip=(.9,.9,1.),truck=truck)]*3
+        full_budget = getattr(self, 'full_budget', False)
+        if full_budget:
+            scripted += [observation(tip=(.9,.9,1.),truck=truck)]*7
         latest, position = None, 0
 
         def enrich(reply):
@@ -181,7 +184,8 @@ class PhysicalCycleTests(unittest.TestCase):
             session = SimpleNamespace(command=[],log_path=log,sock=None,prepare=lambda seed:{},close=lambda:None)
             args = SimpleNamespace(output=output,episodes=1,worker_index=0,worker_count=1,
                 policy_type='smolvla',gpu_label='fixture',seed=2,min_particles=100,video=False,
-                steps=5000,replan_interval=3,save_trajectory=False,progress_interval=0.,
+                steps=37 if full_budget else 5000,run_full_step_budget=full_budget,
+                replan_interval=3,save_trajectory=False,progress_interval=0.,
                 replay_reference=False,fresh_simulator=True,post_rollout_observe_steps=0)
             config = dict(execution_source='model',evaluation_standard=PHYSICAL_MASS_STANDARD,
                 evaluation_profile='diagnostic',evaluation_id='fixture',checkpoint_sha256='fixture',
@@ -197,9 +201,21 @@ class PhysicalCycleTests(unittest.TestCase):
             self.assertEqual(result['repeat_cycles_completed'],3)
             self.assertEqual(result['repeat_cycles_successful'],2)
             self.assertFalse(result['success'])
-            self.assertEqual(result['policy_steps_executed'],30)
+            self.assertEqual(result['policy_steps_executed'],37 if full_budget else 30)
             self.assertEqual(len(json.loads((folder/'goal_updates.json').read_text())),2)
             self.assertEqual(json.loads((folder/'repeat_audit.json').read_text())['status'],'passed')
+            if full_budget:
+                self.assertTrue(result['full_step_budget_completed'])
+                self.assertEqual(result['termination_reason'],'full_step_budget')
+                self.assertEqual(result['repeat_scoring_steps'],30)
+                self.assertEqual(json.loads((folder/'repeat_audit.json').read_text())['model_only_continuation_steps'],7)
+
+
+class FullBudgetSharedLoopTests(unittest.TestCase):
+    full_budget = True
+
+    def test_completed_task_continues_model_actions_to_full_budget_and_audits_tail(self):
+        PhysicalCycleTests.test_shared_model_loop_advances_failed_cycle_and_preserves_history_and_audit(self)
 
 
 if __name__ == '__main__':

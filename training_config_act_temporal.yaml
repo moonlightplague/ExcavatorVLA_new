@@ -1,0 +1,18 @@
+# Model-only temporal adapter: warm-start the repaired ACT, keep the task unchanged.
+extends: training_config_act_repaired.yaml
+model_initialization:
+  checkpoint: outputs/experiments/act_repaired_repeat40k_20261118_01/train/checkpoints/040000/pretrained_model
+policy:
+  pretrained_backbone_weights: null
+  temporal_horizon: 3
+  temporal_stride: 3
+  temporal_layers: 2
+  temporal_lr: 0.0001
+  optimizer_lr: 0.000003
+  optimizer_lr_backbone: 0.000001
+steps: 10000
+job_name: excavator_act_temporal_repaired10k
+output_dir: outputs/experiments/act_temporal_repaired10k_20261118_01/train
+benchmark:
+  split_file: outputs/experiments/act_temporal_repaired10k_20261118_01/prepared/split_manifest.json
+  validation_freq: 10000

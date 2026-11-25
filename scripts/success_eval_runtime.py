@@ -33,6 +33,7 @@ def evaluation_provenance(base, checkpoint, dataset, protocol, software):
                simulator / 'scripts/evaluation/summarize_isaacsim_success_rate.py',
                *[base / 'scripts' / name for name in (
                    'eval_smolvla_success.py', 'success_eval_runtime.py', 'eval_video.py',
+                   'evaluation_action_transfer.py',
                    'excavator_diagnostics.py', 'success_eval_diagnostics.py',
                    'act_temporal_ensemble.py', 'act_carry_guard.py', 'spillage_diagnostics.py',
                    'collection_eval_scenes.py')],

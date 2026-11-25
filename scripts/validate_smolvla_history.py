@@ -38,7 +38,9 @@ def main():
     prepared = Path(launcher['prepared_data'])
     stats = json.loads((prepared / 'normalization_stats.json').read_text())
     from lerobot.scripts import lerobot_train as trainer
-    install_trainer_adapters(trainer, cfg, launcher['observation_history'], stats)
+    provenance_path = prepared / 'training_provenance.json'
+    provenance = json.loads(provenance_path.read_text()) if provenance_path.is_file() else None
+    install_trainer_adapters(trainer, cfg, launcher['observation_history'], stats, provenance)
     cfg.dataset.episodes = cfg.dataset.episodes[:2]
     dataset = trainer.make_dataset(cfg)
     item, first = dataset[20], dataset[0]
@@ -68,7 +70,7 @@ def main():
         postprocessor_overrides={'unnormalizer_processor':{'features':cfg.policy.output_features,
             'norm_map':cfg.policy.normalization_mapping,'stats':tensors}})
     results = []
-    for size in (1,2,4,8,16):
+    for size in sorted({1, cfg.batch_size}):
         policy.zero_grad(set_to_none=True)
         gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
         started = time.monotonic()
@@ -108,12 +110,20 @@ def main():
     del prefix,images,masks,processed
     optimizer=cfg.optimizer.build(policy.get_optim_params())
     scheduler=cfg.scheduler.build(optimizer,cfg.steps)
+    # A diagnostic update at the configured peak LR makes newly added history weights observable.
+    # This temporary model/optimizer is deleted; the production warmup remains unchanged.
+    for group in optimizer.param_groups:group['lr']=cfg.policy.optimizer_lr
     watched={name:p.detach().flatten()[:32].cpu().clone() for name,p in policy.named_parameters()
              if p.requires_grad and ('state_proj' in name or 'action_out_proj' in name)}
     frozen={name:p.detach().flatten()[:32].cpu().clone() for name,p in policy.named_parameters() if not p.requires_grad}
     with torch.autocast('cuda',dtype=torch.bfloat16):
         loss,_=policy(pre(raw))
     loss.backward()
+    state_history = launcher['observation_history'].get('state_projection_input_dim') == 96
+    past_gradient = (policy.model.state_proj.weight.grad[:,:64].abs().max().item()
+                     if state_history else None)
+    if state_history and not past_gradient > 0:
+        raise AssertionError('Past numeric-state slots receive no learning signal')
     norm=torch.nn.utils.clip_grad_norm_(policy.parameters(),cfg.policy.optimizer_grad_clip_norm)
     optimizer.step(); scheduler.step(); optimizer.zero_grad(set_to_none=True)
     changed=[name for name,p in policy.named_parameters() if name in watched and
@@ -142,8 +152,16 @@ def main():
         for key in launcher['observation_history']['cameras']:changed_raw[key][:,:2]=0
         influence=(actual-physical_actions(policy,pre,post,changed_raw,noise)).abs().max().item()
         if influence<=1e-6:raise AssertionError('Historical visual inputs have no observed influence')
+        state_influence = None
+        if state_history:
+            changed_state={key:value.clone() if torch.is_tensor(value) else value for key,value in raw.items()}
+            changed_state['observation.state'][:,:2] += 1
+            state_influence=(actual-physical_actions(policy,pre,post,changed_state,noise)).abs().max().item()
+            if state_influence<=1e-6:
+                raise AssertionError('Learned historical numeric-state inputs have no observed influence')
         padded_expected=physical_actions(policy,pre,post,start,noise)
         for key in launcher['observation_history']['cameras']:start[key][:,:2]=1
+        if state_history:start['observation.state'][:,:2]=12345
         padding_difference=(padded_expected-physical_actions(policy,pre,post,start,noise)).abs().max().item()
         if padding_difference>1e-5:raise AssertionError('Padded historical pixels changed inference')
         optimizer=cfg.optimizer.build(policy.get_optim_params())
@@ -156,7 +174,9 @@ def main():
         'normalization_stats_sha256':file_hash(prepared/'normalization_stats.json'),
         'memory_probes':results,'recommended_micro_batch_size':max(passing),
         'logical_batch_per_gpu':cfg.batch_size,'history_shape':[1,3,3,256,256],
-        'state_shape':[1,3,28],'effective_state_shape':[1,32],'action_shape':[1,10,4],
+        'state_shape':[1,3,28],'effective_state_shape':[1,96 if state_history else 32],'action_shape':[1,10,4],
+        'past_state_gradient_max':past_gradient,'past_state_action_influence_rad_s':state_influence,
+        'diagnostic_update_lr':cfg.policy.optimizer_lr,
         'image_order':'time then cameras 0,1,2','visual_images':9,'prefix_tokens':prefix_tokens,
         'max_position_embeddings':max_positions,'finite_gradient_norm':float(norm),
         'changed_sampled_trainable_parameters':changed,'sampled_frozen_parameters_unchanged':True,
